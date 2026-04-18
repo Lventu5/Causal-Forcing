@@ -117,7 +117,7 @@ Built on [Rolling Forcing](https://github.com/TencentARC/RollingForcing), we imp
 
 ## Training
 
-<img width="2490" height="1050" alt="overview" src="https://github.com/user-attachments/assets/df96fae3-cecc-4915-9a14-d1a5f326074e" />
+<img width="2490" height="850" alt="overview" src="https://github.com/user-attachments/assets/df96fae3-cecc-4915-9a14-d1a5f326074e" />
 
 <details>
 <summary> Stage 1: Autoregressive Diffusion Training (Can skip by using our pretrained checkpoints. Click to expand.)</summary>
