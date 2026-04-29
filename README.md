@@ -264,7 +264,7 @@ Since creating ODE-paired data is very time-consuming, we also provide an altern
     --logdir logs/causal_cd_chunkwise
   ```
 
-> We recommend training no less than 1K steps, and more steps (e.g., 3~5K) will lead to better performance.
+> We recommend training no less than 3K steps, and more steps (e.g., 5K) will lead to better performance.
 
 Inference to test training results:
 
