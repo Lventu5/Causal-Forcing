@@ -54,6 +54,8 @@ We further propose [**Causal Forcing++**](https://arxiv.org/abs/2605.15141), rep
 | Frame-wise 2-step🔥 | 🤗 [Huggingface](https://huggingface.co/zhuhz22/Causal-Forcing/blob/main/causal-forcing%2B%2B/framewise-2step.pt)    | The  first frame-wise 2-step model **even better than 4-step**|
 | Frame-wise 1-step   | 🤗 [Huggingface](https://huggingface.co/zhuhz22/Causal-Forcing/blob/main/causal-forcing%2B%2B/framewise-1step.pt)    | Extremely low latency |
 | Long Video Generator   | 🤗 [Huggingface](https://huggingface.co/zhuhz22/Causal-Forcing/blob/main/chunkwise/longvideo.pt)    | Minute-long AR video generator |
+| HY1.5-TI2V (8B)   | 🤗 [Huggingface](https://huggingface.co/MIN-Lab/minWM)   | Refer to [this repo](https://github.com/shengshu-ai/minWM). |
+| Action-conditioned WM   | 🤗 [Huggingface](https://huggingface.co/MIN-Lab/minWM)    | Refer to [this repo](https://github.com/shengshu-ai/minWM). |
 
 -----
 
