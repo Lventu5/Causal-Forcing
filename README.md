@@ -301,7 +301,7 @@ Since creating ODE-paired data is very time-consuming, we also provide an altern
 
 > Thanks to [@chijw's effort](https://github.com/thu-ml/Causal-Forcing/pull/20), now the EMA mechanism is more efficient!
 
-If you have skipped Stage 1, you need to download the pretrained models:
+If you have skipped Stage 1, you need to download the pretrained multi-step AR diffusion models:
 ```bash
 hf download zhuhz22/Causal-Forcing framewise/ar_diffusion.pt --local-dir checkpoints
 hf download zhuhz22/Causal-Forcing chunkwise/ar_diffusion.pt --local-dir checkpoints
