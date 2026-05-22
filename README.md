@@ -301,6 +301,12 @@ Since creating ODE-paired data is very time-consuming, we also provide an altern
 
 > Thanks to [@chijw's effort](https://github.com/thu-ml/Causal-Forcing/pull/20), now the EMA mechanism is more efficient!
 
+If you have skipped Stage 1, you need to download the pretrained models:
+```bash
+hf download zhuhz22/Causal-Forcing framewise/ar_diffusion.pt --local-dir checkpoints
+hf download zhuhz22/Causal-Forcing chunkwise/ar_diffusion.pt --local-dir checkpoints
+```
+
 - Frame-wise:
   ```bash
   torchrun --nnodes=8 --nproc_per_node=8 --rdzv_id=5235 \
