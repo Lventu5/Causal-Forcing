@@ -62,6 +62,7 @@ We further propose [**Causal Forcing++**](https://arxiv.org/abs/2605.15141), rep
 https://github.com/user-attachments/assets/310f0cfa-e1bb-496d-8941-87f77b3271c0
 
 ## 🔥 News
+- **2026.5.17**: We release Causal Forcing for the HY1.b-TI2V-8B model! Refer to [this repo](https://github.com/shengshu-ai/minWM) for the details.
 - **2026.5.15**: We release [Causal Forcing++](https://arxiv.org/abs/2605.15141), supporting Casual Consistency Distillation for few-step initialization, and open-source **the first frame-wise 2-step AR model** comparable to chunk-wise 4-step models!
 - **2026.5.10**: Thanks to @[AshadowZ](https://github.com/AshadowZ), now our chunk-wise ODE data curation is **3x faster**!
 - **2026.4.16**: **Optimize the Stage 2 🔥consistency distillation🔥 infrastructure for 3× faster training, let's try it now!** We have also released the ckpt.
