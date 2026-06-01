@@ -30,7 +30,7 @@ The Causal Forcing series uses **Causal ODE** or **Causal Consistency Distillati
 
 [Causal Forcing](https://arxiv.org/abs/2602.02214) significantly outperforms Self Forcing in **both visual quality and motion dynamics**, while keeping **the same training budget and inference efficiency**. We support both chunk-wise and **frame-wise** models, with the latter natively unifying T2V and **I2V**.
 
-We further propose [**Causal Forcing++**](https://arxiv.org/abs/2605.15141), replacing ODE with **causal Consistency Distillation** to eliminate ODE data curation and improve performance, releasing the first **1-step/2-step frame-wise** models.
+We further propose [**Causal Forcing++**](https://arxiv.org/abs/2605.15141)[ technical report ], replacing ODE with **causal Consistency Distillation** to eliminate ODE data curation and improve performance, releasing the first **1-step/2-step frame-wise** models.
 
 -----
 <img width="2090" height="850" alt="overview" src="assets/pipeline.png" />
