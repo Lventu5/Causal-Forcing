@@ -1,4 +1,7 @@
+import math
+import os
 import types
+from pathlib import Path
 from typing import List, Optional
 import torch
 from torch import nn
@@ -11,9 +14,116 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
 
 
-class WanTextEncoder(torch.nn.Module):
-    def __init__(self) -> None:
+def _resolve_wan_model_dir(model_name: str, model_root: Optional[str] = None) -> Path:
+    root = Path(model_root or os.environ.get("WAN_MODEL_DIR", "wan_models"))
+    if root.name == model_name or (root / "Wan2.1_VAE.pth").exists():
+        return root
+    return root / model_name
+
+
+class UIActionNodeConditioner(nn.Module):
+    """Frame-aligned UI conditioning adapter for WAN latents."""
+
+    def __init__(
+        self,
+        *,
+        latent_channels: int = 16,
+        action_dim: int = 3,
+        node_token_dim: int = 1024,
+        hidden_dim: int = 256,
+        action_dropout: float = 0.0,
+        node_dropout: float = 0.0,
+        use_node_cross_attn: bool = True,
+    ) -> None:
         super().__init__()
+        self.action_dim = int(action_dim)
+        self.node_token_dim = int(node_token_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.action_dropout = float(action_dropout)
+        self.node_dropout = float(node_dropout)
+        self.use_node_cross_attn = bool(use_node_cross_attn)
+
+        self.action_proj = nn.Sequential(
+            nn.LayerNorm(self.action_dim),
+            nn.Linear(self.action_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, latent_channels),
+        )
+        self.action_gate = nn.Parameter(torch.tensor(1e-3))
+
+        self.q_proj = nn.Linear(latent_channels, self.hidden_dim)
+        self.k_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
+        self.v_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
+        self.node_out = nn.Linear(self.hidden_dim, latent_channels)
+        self.node_gate = nn.Parameter(torch.tensor(1e-3))
+
+    def enable_trainable_parameters(self) -> None:
+        self.requires_grad_(True)
+        if not self.use_node_cross_attn:
+            for module in (self.q_proj, self.k_proj, self.v_proj, self.node_out):
+                module.requires_grad_(False)
+            self.node_gate.requires_grad_(False)
+
+    def _drop_frame_condition(self, value: torch.Tensor, p: float) -> torch.Tensor:
+        if not self.training or p <= 0.0:
+            return value
+        keep = torch.rand(value.shape[:2], device=value.device) >= p
+        while keep.ndim < value.ndim:
+            keep = keep.unsqueeze(-1)
+        return value * keep.to(dtype=value.dtype)
+
+    def forward(
+        self,
+        latents: torch.Tensor,
+        *,
+        action_cond: Optional[torch.Tensor] = None,
+        node_tokens: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # latents: [B, F, C, H, W]
+        out = latents
+        dtype = latents.dtype
+
+        if action_cond is not None:
+            action_cond = self._drop_frame_condition(action_cond.to(dtype=latents.dtype), self.action_dropout)
+            action_bias = self.action_proj(action_cond.float()).to(dtype=dtype)
+            out = out + torch.tanh(self.action_gate).to(dtype=dtype) * action_bias[..., None, None]
+
+        if self.use_node_cross_attn and node_tokens is not None:
+            bsz, frames, channels, height, width = out.shape
+            tokens = self._drop_frame_condition(node_tokens.to(dtype=latents.dtype), self.node_dropout)
+            tokens = tokens.reshape(bsz * frames, tokens.shape[-2], tokens.shape[-1])
+
+            if node_mask is None:
+                mask = torch.ones(tokens.shape[:2], dtype=torch.bool, device=out.device)
+            else:
+                mask = node_mask.reshape(bsz * frames, node_mask.shape[-1]).to(device=out.device).bool()
+                empty = ~mask.any(dim=-1)
+                if empty.any():
+                    mask = mask.clone()
+                    mask[empty, 0] = True
+                    tokens = tokens.clone()
+                    tokens[empty] = 0
+
+            spatial = out.permute(0, 1, 3, 4, 2).reshape(bsz * frames, height * width, channels)
+            query = self.q_proj(spatial.float())
+            key = self.k_proj(tokens.float())
+            value = self.v_proj(tokens.float())
+            score = torch.bmm(query, key.transpose(1, 2)) / math.sqrt(float(self.hidden_dim))
+            score = score.masked_fill(~mask[:, None, :], torch.finfo(score.dtype).min)
+            attn = torch.softmax(score, dim=-1)
+            attended = torch.bmm(attn, value)
+            residual = self.node_out(attended).to(dtype=dtype)
+            residual = residual.reshape(bsz, frames, height, width, channels).permute(0, 1, 4, 2, 3)
+            out = out + torch.tanh(self.node_gate).to(dtype=dtype) * residual
+
+        return out
+
+
+class WanTextEncoder(torch.nn.Module):
+    def __init__(self, model_name: str = "Wan2.1-T2V-1.3B", model_root: Optional[str] = None) -> None:
+        super().__init__()
+        model_dir = _resolve_wan_model_dir(model_name, model_root)
 
         self.text_encoder = umt5_xxl(
             encoder_only=True,
@@ -22,12 +132,12 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(str(model_dir / "models_t5_umt5-xxl-enc-bf16.pth"),
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=str(model_dir / "google" / "umt5-xxl"), seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -51,8 +161,9 @@ class WanTextEncoder(torch.nn.Module):
 
 
 class WanVAEWrapper(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, model_name: str = "Wan2.1-T2V-1.3B", model_root: Optional[str] = None):
         super().__init__()
+        model_dir = _resolve_wan_model_dir(model_name, model_root)
         mean = [
             -0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921
@@ -66,7 +177,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         # init model
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=str(model_dir / "Wan2.1_VAE.pth"),
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -116,18 +227,21 @@ class WanDiffusionWrapper(torch.nn.Module):
     def __init__(
             self,
             model_name="Wan2.1-T2V-1.3B",
+            model_root: Optional[str] = None,
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            ui_conditioning: Optional[dict] = None,
     ):
         super().__init__()
+        model_dir = _resolve_wan_model_dir(model_name, model_root)
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                str(model_dir), local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(str(model_dir))
         self.model.eval()
 
         # For non-causal diffusion, all frames share the same timestep
@@ -139,7 +253,48 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.scheduler.set_timesteps(1000, training=True)
 
         self.seq_len = 32760  # [1, 21, 16, 60, 104]
+        self.frame_seq_length = 1560
+        self.ui_conditioner = None
+        self.node_conditioning_enabled = False
+        self.block_cross_attn_enabled = False
+        self.train_ui_conditioner_only = False
+        if ui_conditioning is not None and bool(ui_conditioning.get("enabled", False)):
+            node_token_dim = int(ui_conditioning.get("node_token_dim", 1024))
+            node_dropout = float(ui_conditioning.get("node_dropout", 0.0))
+            self.block_cross_attn_enabled = bool(ui_conditioning.get("block_cross_attn", False))
+            has_node_token_dim = (
+                hasattr(ui_conditioning, "__contains__")
+                and "node_token_dim" in ui_conditioning
+            )
+            self.node_conditioning_enabled = (
+                self.block_cross_attn_enabled
+                or bool(ui_conditioning.get("node_conditioning", False))
+                or has_node_token_dim
+            )
+            if self.block_cross_attn_enabled:
+                self.model.add_condition_cross_attention(
+                    condition_dim=node_token_dim,
+                    dropout=node_dropout,
+                )
+            self.ui_conditioner = UIActionNodeConditioner(
+                latent_channels=int(ui_conditioning.get("latent_channels", 16)),
+                action_dim=int(ui_conditioning.get("action_dim", 3)),
+                node_token_dim=node_token_dim,
+                hidden_dim=int(ui_conditioning.get("hidden_dim", 256)),
+                action_dropout=float(ui_conditioning.get("action_dropout", 0.0)),
+                node_dropout=node_dropout,
+                use_node_cross_attn=self.node_conditioning_enabled and not self.block_cross_attn_enabled,
+            )
+            self.train_ui_conditioner_only = bool(ui_conditioning.get("freeze_backbone", False))
         self.post_init()
+
+    def enable_trainable_ui_conditioning_only(self) -> None:
+        self.model.requires_grad_(False)
+        if self.ui_conditioner is not None:
+            self.ui_conditioner.enable_trainable_parameters()
+        set_condition_grad = getattr(self.model, "set_condition_cross_attention_requires_grad", None)
+        if set_condition_grad is not None:
+            set_condition_grad(True)
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
@@ -215,6 +370,60 @@ class WanDiffusionWrapper(torch.nn.Module):
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
 
+    def _frame_start_from_tokens(self, current_start: Optional[int]) -> int:
+        if current_start is None:
+            return 0
+        if isinstance(current_start, torch.Tensor):
+            current_start = int(current_start.item())
+        return int(current_start) // self.frame_seq_length
+
+    def _slice_condition(self, value: torch.Tensor, frame_start: int, frames: int) -> torch.Tensor:
+        if value.shape[1] == frames:
+            return value
+        if value.shape[1] >= frame_start + frames:
+            return value[:, frame_start:frame_start + frames]
+        if value.shape[1] == 1:
+            return value.expand(-1, frames, *value.shape[2:])
+        raise ValueError(
+            f"UI condition has {value.shape[1]} frames, cannot slice "
+            f"frame_start={frame_start}, frames={frames}."
+        )
+
+    def _prepare_ui_conditioning(
+        self,
+        noisy_image_or_video: torch.Tensor,
+        conditional_dict: dict,
+        current_start: Optional[int],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.ui_conditioner is None and not self.block_cross_attn_enabled:
+            return noisy_image_or_video, None, None
+        if "action_cond" not in conditional_dict and "node_tokens" not in conditional_dict:
+            return noisy_image_or_video, None, None
+
+        frames = noisy_image_or_video.shape[1]
+        frame_start = int(conditional_dict.get("ui_frame_start", self._frame_start_from_tokens(current_start)))
+        action_cond = conditional_dict.get("action_cond")
+        node_tokens = conditional_dict.get("node_tokens")
+        node_mask = conditional_dict.get("node_mask")
+        if action_cond is not None:
+            action_cond = self._slice_condition(action_cond.to(device=noisy_image_or_video.device), frame_start, frames)
+        if node_tokens is not None:
+            node_tokens = self._slice_condition(node_tokens.to(device=noisy_image_or_video.device), frame_start, frames)
+        if node_mask is not None:
+            node_mask = self._slice_condition(node_mask.to(device=noisy_image_or_video.device), frame_start, frames)
+
+        if self.ui_conditioner is not None:
+            noisy_image_or_video = self.ui_conditioner(
+                noisy_image_or_video,
+                action_cond=action_cond,
+                node_tokens=node_tokens if self.node_conditioning_enabled and not self.block_cross_attn_enabled else None,
+                node_mask=node_mask if self.node_conditioning_enabled and not self.block_cross_attn_enabled else None,
+            )
+        if not self.node_conditioning_enabled or not self.block_cross_attn_enabled:
+            node_tokens = None
+            node_mask = None
+        return noisy_image_or_video, node_tokens, node_mask
+
     def forward(
         self,
         noisy_image_or_video: torch.Tensor, conditional_dict: dict,
@@ -230,6 +439,11 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
+        noisy_image_or_video, condition_tokens, condition_mask = self._prepare_ui_conditioning(
+            noisy_image_or_video,
+            conditional_dict,
+            current_start=current_start,
+        )
 
         # [B, F] -> [B]
         if self.uniform_timestep:
@@ -247,7 +461,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
-                cache_start=cache_start
+                cache_start=cache_start,
+                condition_tokens=condition_tokens,
+                condition_mask=condition_mask,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -258,6 +474,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                     seq_len=self.seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4), # => [B, C, F, H, W]
                     aug_t=aug_t,
+                    condition_tokens=condition_tokens,
+                    condition_mask=condition_mask,
                 ).permute(0, 2, 1, 3, 4)
             else:
                 # diffusion forcing or bidirectional
@@ -270,14 +488,18 @@ class WanDiffusionWrapper(torch.nn.Module):
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings
+                        concat_time_embeddings=concat_time_embeddings,
+                        condition_tokens=condition_tokens,
+                        condition_mask=condition_mask,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        seq_len=self.seq_len,
+                        condition_tokens=condition_tokens,
+                        condition_mask=condition_mask,
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

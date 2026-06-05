@@ -6,13 +6,24 @@ from model.base import BaseModel
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.scheduler import FlowMatchScheduler
 from pipeline import CausalDiffusionInferencePipeline
+
+
+def _cfg_get(config, key, default=None):
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class NaiveConsistency(BaseModel):
     def __init__(self, args, device):
         super().__init__(args, device)
         print(args)
         # Step 1: Initialize all models
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=args.is_causal)
-        self.generator.model.requires_grad_(True)
+        if getattr(self.generator, "train_ui_conditioner_only", False):
+            self.generator.enable_trainable_ui_conditioning_only()
+        else:
+            self.generator.model.requires_grad_(True)
         
         
         self.generator_ema = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=args.is_causal)
@@ -32,16 +43,17 @@ class NaiveConsistency(BaseModel):
             print(f"Loading pretrained generator from {args.generator_ckpt}")
             state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
                 'generator']
+            strict = not bool(getattr(args, "allow_partial_generator_load", False))
             self.generator.load_state_dict(
-                state_dict, strict=True
+                state_dict, strict=strict
             )
             
             self.teacher.load_state_dict(
-                state_dict, strict=True
+                state_dict, strict=strict
             )
             
             self.generator_ema.load_state_dict(
-                state_dict, strict=True
+                state_dict, strict=strict
             )
                          
         self.independent_first_frame = getattr(args, "independent_first_frame", False)
@@ -65,7 +77,10 @@ class NaiveConsistency(BaseModel):
         
     def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
-        self.generator.model.requires_grad_(True)
+        if getattr(self.generator, "train_ui_conditioner_only", False):
+            self.generator.enable_trainable_ui_conditioning_only()
+        else:
+            self.generator.model.requires_grad_(True)
 
         self.teacher = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.teacher.model.requires_grad_(False)
@@ -73,7 +88,11 @@ class NaiveConsistency(BaseModel):
         self.generator_ema = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=args.is_causal)
         self.generator_ema.model.requires_grad_(False)
         
-        self.text_encoder = WanTextEncoder()
+        model_kwargs = getattr(args, "model_kwargs", {})
+        self.text_encoder = WanTextEncoder(
+            model_name=_cfg_get(model_kwargs, "model_name", "Wan2.1-T2V-1.3B"),
+            model_root=_cfg_get(model_kwargs, "model_root", None),
+        )
         self.text_encoder.requires_grad_(False)
 
         
@@ -87,7 +106,8 @@ class NaiveConsistency(BaseModel):
             conditional_dict,
             unconditional_dict,
             clean_latent,
-            ema_model
+            ema_model,
+            loss_weight=None,
         ) -> Tuple[torch.Tensor, dict]:
         
         clean_latent = clean_latent.to(self.device).to(torch.bfloat16)
@@ -104,6 +124,12 @@ class NaiveConsistency(BaseModel):
             clean_latent, noise=noise,
             timestep=t * torch.ones([1], device=self.device)
         ).to(torch.bfloat16)
+        loss_frame_mask = torch.ones([B, num_frames], device=self.device, dtype=torch.float32)
+        if getattr(self.args, "i2v", False):
+            latent_t[:, :1] = clean_latent[:, :1]
+            timestep[:, :1] = 0
+            timestep_next[:, :1] = 0
+            loss_frame_mask[:, :1] = 0
 
         # Full-frame teacher forward (replaces per-frame loop)
         with torch.no_grad():
@@ -134,12 +160,21 @@ class NaiveConsistency(BaseModel):
             _, cm_pred_t_next = self.generator_ema(
                 latent_t_next, conditional_dict, timestep_next, clean_x = clean_latent
             )
-            
+
         with torch.enable_grad():
-            loss = F.mse_loss(cm_pred_t, cm_pred_t_next, reduction="mean")
+            loss_map = F.mse_loss(cm_pred_t, cm_pred_t_next, reduction="none")
+            if loss_weight is not None:
+                loss_map = loss_map * loss_weight.to(
+                    device=loss_map.device,
+                    dtype=loss_map.dtype,
+                )
+            per_frame_loss = loss_map.mean(dim=[2, 3, 4])
+            loss = (per_frame_loss * loss_frame_mask).sum() / loss_frame_mask.sum().clamp_min(1.0)
 
         log_dict = {
             "unnormalized_loss": F.mse_loss(cm_pred_t, cm_pred_t_next, reduction='none').mean(dim=[1, 2, 3, 4]).detach(),
         }
+        if loss_weight is not None:
+            log_dict["element_weight_mean"] = loss_weight.detach().float().mean()
 
         return loss, log_dict

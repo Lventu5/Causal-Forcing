@@ -9,6 +9,12 @@ from utils.loss import get_denoising_loss
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def _cfg_get(config, key, default=None):
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class BaseModel(nn.Module):
     def __init__(self, args, device):
         super().__init__()
@@ -43,18 +49,33 @@ class BaseModel(nn.Module):
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
         self.iscausal = getattr(args, "causal", True)
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=self.iscausal)
-        self.generator.model.requires_grad_(True)
+        if getattr(self.generator, "train_ui_conditioner_only", False):
+            self.generator.enable_trainable_ui_conditioning_only()
+        else:
+            self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        score_model_kwargs = getattr(args, "score_model_kwargs", {})
+        model_kwargs = getattr(args, "model_kwargs", {})
+        model_root = _cfg_get(model_kwargs, "model_root", None)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name,
+            model_root=_cfg_get(score_model_kwargs, "model_root", model_root),
+            is_causal=False,
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name,
+            model_root=_cfg_get(score_model_kwargs, "model_root", model_root),
+            is_causal=False,
+        )
         self.fake_score.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
+        text_model_name = _cfg_get(model_kwargs, "model_name", "Wan2.1-T2V-1.3B")
+        self.text_encoder = WanTextEncoder(model_name=text_model_name, model_root=model_root)
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(model_name=text_model_name, model_root=model_root)
         self.vae.requires_grad_(False)
 
         self.scheduler = self.generator.get_scheduler()
@@ -144,10 +165,16 @@ class SelfForcingModel(BaseModel):
         else:
             noise_shape = image_or_video_shape.copy()
 
-        # During training, the number of generated frames should be uniformly sampled from
-        # [21, self.num_training_frames], but still being a multiple of self.num_frame_per_block
-        min_num_frames = 20 if self.args.independent_first_frame else 21
-        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
+        # During training, sample generated frames, excluding provided I2V
+        # context frames. UI I2V uses one clean initial frame plus generated
+        # future frames.
+        num_input_frames = initial_latent.shape[1] if initial_latent is not None else 0
+        if self.args.i2v and num_input_frames > 0:
+            min_num_frames = max(self.num_frame_per_block, 21 - num_input_frames)
+            max_num_frames = self.num_training_frames - num_input_frames
+        else:
+            min_num_frames = 20 if self.args.independent_first_frame else 21
+            max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
         assert max_num_frames % self.num_frame_per_block == 0
         assert min_num_frames % self.num_frame_per_block == 0
         max_num_blocks = max_num_frames // self.num_frame_per_block
@@ -163,7 +190,7 @@ class SelfForcingModel(BaseModel):
         noise_shape[1] = num_generated_frames
         
         clean_image_or_video = None
-        if clean_latent:
+        if clean_latent is not None:
             clean_image_or_video = clean_latent.to(self.dtype)
             clean_image_or_video = clean_image_or_video.to(self.device)
             assert clean_image_or_video.shape == tuple(noise_shape), f"{clean_image_or_video.shape} != {tuple(noise_shape)}"

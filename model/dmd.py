@@ -134,7 +134,8 @@ class DMD(SelfForcingModel):
         unconditional_dict: dict,
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
-        denoised_timestep_to: int = 0
+        denoised_timestep_to: int = 0,
+        loss_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -187,13 +188,19 @@ class DMD(SelfForcingModel):
                 unconditional_dict=unconditional_dict
             )
 
+        target = (original_latent.double() - grad.double()).detach()
+        loss_map = (original_latent.double() - target) ** 2
+        if loss_weight is not None:
+            weight = loss_weight.to(device=loss_map.device, dtype=loss_map.dtype)
+            if weight.shape[1] != loss_map.shape[1]:
+                weight = weight[:, -loss_map.shape[1]:]
+            loss_map = loss_map * weight
         if gradient_mask is not None:
             # Useless if we set always 21 latent frames
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
-        else:
-            dmd_loss = 0.5 * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+            loss_map = loss_map[gradient_mask]
+        dmd_loss = 0.5 * loss_map.mean()
+        if loss_weight is not None:
+            dmd_log_dict["element_weight_mean"] = loss_weight.detach().float().mean()
         return dmd_loss, dmd_log_dict
 
     def generator_loss(
@@ -202,7 +209,8 @@ class DMD(SelfForcingModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        loss_weight: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -232,7 +240,8 @@ class DMD(SelfForcingModel):
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
-            denoised_timestep_to=denoised_timestep_to
+            denoised_timestep_to=denoised_timestep_to,
+            loss_weight=loss_weight,
         )
 
         return dmd_loss, dmd_log_dict

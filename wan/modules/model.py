@@ -3,6 +3,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import repeat
@@ -272,6 +273,154 @@ WAN_CROSSATTENTION_CLASSES = {
 }
 
 
+class WanCrossAttention(nn.Module):
+    """Generic frame-aligned cross-attention for extra condition tokens."""
+
+    def __init__(
+        self,
+        dim,
+        num_heads,
+        condition_dim=None,
+        qk_norm=True,
+        eps=1e-6,
+        dropout=0.0,
+    ):
+        assert dim % num_heads == 0
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.condition_dim = dim if condition_dim is None else int(condition_dim)
+        self.dropout = float(dropout)
+
+        self.q = nn.Linear(dim, dim)
+        self.k = nn.Linear(self.condition_dim, dim)
+        self.v = nn.Linear(self.condition_dim, dim)
+        self.o = nn.Linear(dim, dim)
+        self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+        self.gate = nn.Parameter(torch.tensor(1e-3))
+
+        nn.init.xavier_uniform_(self.q.weight)
+        nn.init.xavier_uniform_(self.k.weight)
+        nn.init.xavier_uniform_(self.v.weight)
+        nn.init.xavier_uniform_(self.o.weight)
+        for layer in (self.q, self.k, self.v, self.o):
+            if layer.bias is not None:
+                nn.init.zeros_(layer.bias)
+
+    @staticmethod
+    def _align_frames(value, num_frames, *, fill_value=0, unframed_ndim=3):
+        if value is None:
+            return None
+        if value.ndim == unframed_ndim:
+            value = value.unsqueeze(1)
+        if value.shape[1] == num_frames:
+            return value
+        if value.shape[1] == 1:
+            return value.expand(-1, num_frames, *value.shape[2:])
+        if value.shape[1] * 2 == num_frames:
+            pad_shape = list(value.shape)
+            pad_shape[1] = value.shape[1]
+            pad = value.new_full(pad_shape, fill_value)
+            return torch.cat([pad, value], dim=1)
+        raise ValueError(
+            f"Condition has {value.shape[1]} frames, cannot align to {num_frames} frames."
+        )
+
+    def forward(
+        self,
+        x,
+        condition_tokens,
+        condition_mask=None,
+        *,
+        num_frames=None,
+        frame_seqlen=None,
+    ):
+        r"""
+        Args:
+            x(Tensor): Shape [B, L, C].
+            condition_tokens(Tensor): Shape [B, F, K, D] or [B, K, D].
+            condition_mask(Tensor, optional): Shape [B, F, K] or [B, K].
+        """
+        if condition_tokens is None:
+            return x.new_zeros(x.shape)
+
+        bsz, seq_len, channels = x.shape
+        if num_frames is None:
+            num_frames = condition_tokens.shape[1] if condition_tokens.ndim == 4 else 1
+        num_frames = int(num_frames)
+        if frame_seqlen is None:
+            if seq_len % num_frames != 0:
+                raise ValueError(
+                    f"Sequence length {seq_len} is not divisible by {num_frames} frames."
+                )
+            frame_seqlen = seq_len // num_frames
+        frame_seqlen = int(frame_seqlen)
+        active_len = num_frames * frame_seqlen
+        if active_len > seq_len:
+            raise ValueError(
+                f"Condition span {active_len} exceeds sequence length {seq_len}."
+            )
+
+        dtype = x.dtype
+        tokens = condition_tokens.to(device=x.device, dtype=dtype)
+        tokens = self._align_frames(tokens, num_frames)
+        if tokens.shape[0] != bsz:
+            raise ValueError(
+                f"Condition batch {tokens.shape[0]} does not match latent batch {bsz}."
+            )
+
+        if condition_mask is None:
+            mask = torch.ones(tokens.shape[:3], dtype=torch.bool, device=x.device)
+        else:
+            mask = condition_mask.to(device=x.device).bool()
+            mask = self._align_frames(
+                mask,
+                num_frames,
+                fill_value=False,
+                unframed_ndim=2,
+            )
+
+        flat_tokens = tokens.reshape(bsz * num_frames, tokens.shape[-2], tokens.shape[-1])
+        flat_mask = mask.reshape(bsz * num_frames, mask.shape[-1])
+        empty = ~flat_mask.any(dim=-1)
+        if empty.any():
+            flat_mask = flat_mask.clone()
+            flat_mask[empty, 0] = True
+            flat_tokens = flat_tokens.clone()
+            flat_tokens[empty] = 0
+
+        x_active = x[:, :active_len]
+        query_tokens = x_active.reshape(bsz * num_frames, frame_seqlen, channels)
+        q = self.norm_q(self.q(query_tokens)).view(
+            bsz * num_frames, frame_seqlen, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        k = self.norm_k(self.k(flat_tokens)).view(
+            bsz * num_frames, flat_tokens.shape[1], self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        v = self.v(flat_tokens).view(
+            bsz * num_frames, flat_tokens.shape[1], self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        attn_mask = torch.zeros(
+            flat_mask.shape[0], 1, 1, flat_mask.shape[1],
+            dtype=q.dtype, device=x.device,
+        )
+        attn_mask = attn_mask.masked_fill(~flat_mask[:, None, None, :], torch.finfo(q.dtype).min)
+        attended = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+        attended = attended.transpose(1, 2).flatten(2)
+        residual = self.o(attended).reshape(bsz, active_len, channels)
+
+        out = x.new_zeros(x.shape)
+        out[:, :active_len] = torch.tanh(self.gate).to(dtype=dtype) * residual.to(dtype=dtype)
+        return out
+
+
 class WanAttentionBlock(nn.Module):
 
     def __init__(self,
@@ -304,6 +453,7 @@ class WanAttentionBlock(nn.Module):
                                                                       (-1, -1),
                                                                       qk_norm,
                                                                       eps)
+        self.condition_cross_attn = None
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -321,6 +471,8 @@ class WanAttentionBlock(nn.Module):
         freqs,
         context,
         context_lens,
+        condition_tokens=None,
+        condition_mask=None,
     ):
         r"""
         Args:
@@ -345,6 +497,16 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            if self.condition_cross_attn is not None and condition_tokens is not None:
+                num_frames = int(condition_tokens.shape[1]) if condition_tokens.ndim == 4 else 1
+                frame_seqlen = x.shape[1] // num_frames
+                x = x + self.condition_cross_attn(
+                    self.norm3(x),
+                    condition_tokens,
+                    condition_mask,
+                    num_frames=num_frames,
+                    frame_seqlen=frame_seqlen,
+                )
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             # with amp.autocast(dtype=torch.float32):
             x = x + y * e[5]
@@ -647,6 +809,8 @@ class WanModel(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        condition_tokens=None,
+        condition_mask=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -718,7 +882,9 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            context_lens=context_lens)
+            context_lens=context_lens,
+            condition_tokens=condition_tokens,
+            condition_mask=condition_mask)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -769,6 +935,26 @@ class WanModel(ModelMixin, ConfigMixin):
             return torch.stack(x), final_x
 
         return torch.stack(x)
+
+    def add_condition_cross_attention(
+        self,
+        condition_dim=1024,
+        dropout=0.0,
+    ):
+        for block in self.blocks:
+            block.condition_cross_attn = WanCrossAttention(
+                self.dim,
+                self.num_heads,
+                condition_dim=condition_dim,
+                qk_norm=self.qk_norm,
+                eps=self.eps,
+                dropout=dropout,
+            )
+
+    def set_condition_cross_attention_requires_grad(self, requires_grad=True):
+        for block in self.blocks:
+            if block.condition_cross_attn is not None:
+                block.condition_cross_attn.requires_grad_(requires_grad)
 
     def _forward_classify(
         self,

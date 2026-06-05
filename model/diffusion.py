@@ -5,6 +5,12 @@ from model.base import BaseModel
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
+def _cfg_get(config, key, default=None):
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class CausalDiffusion(BaseModel):
     def __init__(self, args, device):
         """
@@ -34,12 +40,22 @@ class CausalDiffusion(BaseModel):
 
     def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
-        self.generator.model.requires_grad_(True)
+        if getattr(self.generator, "train_ui_conditioner_only", False):
+            self.generator.enable_trainable_ui_conditioning_only()
+        else:
+            self.generator.model.requires_grad_(True)
 
-        self.text_encoder = WanTextEncoder()
+        model_kwargs = getattr(args, "model_kwargs", {})
+        self.text_encoder = WanTextEncoder(
+            model_name=_cfg_get(model_kwargs, "model_name", "Wan2.1-T2V-1.3B"),
+            model_root=_cfg_get(model_kwargs, "model_root", None),
+        )
         self.text_encoder.requires_grad_(False)
 
-        self.vae = WanVAEWrapper()
+        self.vae = WanVAEWrapper(
+            model_name=_cfg_get(model_kwargs, "model_name", "Wan2.1-T2V-1.3B"),
+            model_root=_cfg_get(model_kwargs, "model_root", None),
+        )
         self.vae.requires_grad_(False)
         
         self.scheduler = self.generator.get_scheduler()
@@ -51,7 +67,8 @@ class CausalDiffusion(BaseModel):
         conditional_dict: dict,
         unconditional_dict: dict,
         clean_latent: torch.Tensor,
-        initial_latent: torch.Tensor = None
+        initial_latent: torch.Tensor = None,
+        loss_weight: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -86,6 +103,19 @@ class CausalDiffusion(BaseModel):
             timestep.flatten(0, 1)
         ).unflatten(0, (batch_size, num_frame))
         training_target = self.scheduler.training_target(clean_latent, noise, timestep)
+        loss_frame_mask = torch.ones(
+            [batch_size, num_frame],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        if getattr(self.args, "i2v", False) and initial_latent is not None:
+            noisy_latents[:, :initial_latent.shape[1]] = initial_latent.to(
+                device=self.device,
+                dtype=self.dtype,
+            )
+            timestep[:, :initial_latent.shape[1]] = 0
+            training_target[:, :initial_latent.shape[1]] = 0
+            loss_frame_mask[:, :initial_latent.shape[1]] = 0
 
         # Step 3: Noise augmentation, also add small noise to clean context latents
         if self.noise_augmentation_max_timestep > 0:
@@ -116,15 +146,23 @@ class CausalDiffusion(BaseModel):
             clean_x=clean_latent_aug if self.teacher_forcing else None,
             aug_t=timestep_clean_aug if self.teacher_forcing else None
         )
-        # loss = torch.nn.functional.mse_loss(flow_pred.float(), training_target.float())
-        loss = torch.nn.functional.mse_loss(
+        loss_map = torch.nn.functional.mse_loss(
             flow_pred.float(), training_target.float(), reduction='none'
-        ).mean(dim=(2, 3, 4))
-        loss = loss * self.scheduler.training_weight(timestep).unflatten(0, (batch_size, num_frame))
-        loss = loss.mean()
+        )
+        if loss_weight is not None:
+            loss_map = loss_map * loss_weight.to(
+                device=loss_map.device,
+                dtype=loss_map.dtype,
+            )
+        per_frame_loss = loss_map.mean(dim=(2, 3, 4))
+        loss = per_frame_loss * self.scheduler.training_weight(timestep).unflatten(0, (batch_size, num_frame))
+        loss = loss * loss_frame_mask
+        loss = loss.sum() / loss_frame_mask.sum().clamp_min(1.0)
 
         log_dict = {
             "x0": clean_latent.detach(),
             "x0_pred": x0_pred.detach()
         }
+        if loss_weight is not None:
+            log_dict["element_weight_mean"] = loss_weight.detach().float().mean()
         return loss, log_dict

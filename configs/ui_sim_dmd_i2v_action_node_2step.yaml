@@ -1,0 +1,84 @@
+trainer: score_distillation
+distribution_loss: dmd
+dataset_type: ui_sim_latent
+data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
+generator_ckpt: ${oc.env:CF_UI_STAGE2_ACTION_NODE_CKPT,checkpoints/ui_sim/action_node_stage2/model.pt}
+allow_partial_generator_load: false
+
+i2v: true
+causal: true
+independent_first_frame: false
+num_frame_per_block: 1
+num_training_frames: 21
+image_or_video_shape: [1, 21, 16, 60, 104]
+height: 480
+width: 832
+num_frames: 21
+
+denoising_step_list: [1000, 500]
+denoising_step_list_first_chunk: [1000, 750, 500, 250]
+warp_denoising_step: true
+same_step_across_blocks: true
+last_step_only: false
+backward_simulation: true
+context_noise: 0
+
+ui_prompt: desktop file manager UI transition
+ui_source_width: 1024
+ui_source_height: 768
+ui_action_coordinate_mode: legacy_normalized_source
+ui_random_clip: true
+ui_graph_tokens_per_frame: 32
+ui_graph_token_dim: 1024
+ui_graph_token_has_mask: true
+
+element_loss:
+  enabled: false
+  cache_dir: ${oc.env:UI_SIM_ELEMENT_CACHE,element_cache}
+  base_weight: 1.0
+  element_boost: 20.0
+  text_cache_dir: ""
+  text_boost: 50.0
+  text_min_confidence: 0.5
+  text_padding_px: 2
+
+model_kwargs:
+  model_name: Wan2.1-T2V-1.3B
+  model_root: ${oc.env:WAN_MODEL_DIR,wan_models}
+  timestep_shift: 5.0
+  local_attn_size: 21
+  sink_size: 0
+  ui_conditioning:
+    enabled: true
+    action_dim: 3
+    node_token_dim: 1024
+    latent_channels: 16
+    hidden_dim: 256
+    block_cross_attn: true
+    freeze_backbone: true
+    action_dropout: 0.02
+    node_dropout: 0.02
+
+real_name: ${oc.env:CF_REAL_SCORE_MODEL,Wan2.1-T2V-1.3B}
+fake_name: Wan2.1-T2V-1.3B
+load_raw_video: false
+gradient_checkpointing: true
+mixed_precision: true
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+real_guidance_scale: 3.0
+fake_guidance_scale: 0.0
+denoising_loss_type: flow
+ts_schedule: false
+lr: 5.0e-5
+lr_critic: 1.0e-5
+weight_decay: 0.01
+dfake_gen_update_ratio: 5
+batch_size: 1
+num_workers: 8
+ema_weight: 0.99
+ema_start_step: 200
+log_iters: 500
+disable_wandb: true
+negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

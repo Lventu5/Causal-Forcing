@@ -1,10 +1,11 @@
 from tqdm import tqdm
-from typing import List, Optional
+from typing import List, Mapping, Optional
 import torch
 
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.ui_sim_conditioning import attach_ui_batch_conditioning
 
 
 class CausalDiffusionInferencePipeline(torch.nn.Module):
@@ -53,6 +54,7 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         noise: torch.Tensor,
         text_prompts: List[str],
         initial_latent: Optional[torch.Tensor] = None,
+        ui_batch: Optional[Mapping[str, object]] = None,
         return_latents: bool = False,
         start_frame_index: Optional[int] = 0,
         return_video=True
@@ -91,6 +93,16 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         unconditional_dict = self.text_encoder(
             text_prompts=[self.args.negative_prompt] * len(text_prompts)
         )
+        if ui_batch is not None:
+            conditional_dict, unconditional_dict = attach_ui_batch_conditioning(
+                ui_batch,
+                conditional_dict,
+                unconditional_dict,
+                device=noise.device,
+                dtype=noise.dtype,
+                num_latent_frames=num_output_frames,
+                i2v=initial_latent is not None,
+            )
 
         output = torch.zeros(
             [batch_size, num_output_frames, num_channels, height, width],

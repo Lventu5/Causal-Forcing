@@ -17,11 +17,13 @@ def main():
     parser.add_argument("--disable-wandb", action="store_true")
     parser.add_argument("--tf", action="store_true")
 
-    args = parser.parse_args()
+    args, overrides = parser.parse_known_args()
 
     config = OmegaConf.load(args.config_path)
     default_config = OmegaConf.load("configs/default_config.yaml")
     config = OmegaConf.merge(default_config, config)
+    if overrides:
+        config = OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
     config.tf = args.tf 
@@ -30,7 +32,7 @@ def main():
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
-    config.disable_wandb = args.disable_wandb
+    config.disable_wandb = args.disable_wandb or bool(getattr(config, "disable_wandb", False))
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)

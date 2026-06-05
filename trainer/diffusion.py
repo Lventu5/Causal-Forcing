@@ -2,8 +2,14 @@ import gc
 import logging
 
 from model import CausalDiffusion
-from utils.dataset import cycle, LatentLMDBDataset
+from utils.dataset import cycle
 from utils.misc import set_seed
+from utils.ui_sim_conditioning import attach_ui_batch_conditioning
+from utils.ui_sim_dataset import build_training_dataset
+from utils.ui_sim_element_loss import (
+    build_element_loss_weighter,
+    build_element_loss_weight_map,
+)
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
@@ -58,6 +64,10 @@ class Trainer:
 
         # Step 2: Initialize the model and optimizer
         self.model = CausalDiffusion(config, device=self.device)
+        self.element_loss_weighter = build_element_loss_weighter(
+            config,
+            is_main_process=self.is_main_process,
+        )
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
@@ -85,7 +95,7 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = LatentLMDBDataset(config.data_path, max_pair=int(1e8))
+        dataset = build_training_dataset(config)
        
         self.dataset = dataset
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -94,7 +104,7 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=int(getattr(config, "num_workers", 8)))
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -143,7 +153,10 @@ class Trainer:
                         k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
                     fixed[k] = v
                 state_dict = fixed
-            self.model.generator.load_state_dict(state_dict, strict=True)
+            strict = not bool(getattr(config, "allow_partial_generator_load", False))
+            load_result = self.model.generator.load_state_dict(state_dict, strict=strict)
+            if self.is_main_process and not strict:
+                print(f"Generator load result: {load_result}")
 
         ##############################################################################################################
 
@@ -224,6 +237,21 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+        conditional_dict, unconditional_dict = attach_ui_batch_conditioning(
+            batch,
+            conditional_dict,
+            unconditional_dict,
+            device=self.device,
+            dtype=self.dtype,
+            num_latent_frames=clean_latent.shape[1],
+            i2v=bool(getattr(self.config, "i2v", False)),
+        )
+        loss_weight = build_element_loss_weight_map(
+            self.element_loss_weighter,
+            batch,
+            clean_latent,
+            device=self.device,
+        )
 
         # Step 3: Train the generator
         generator_loss, log_dict = self.model.generator_loss(
@@ -231,7 +259,8 @@ class Trainer:
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             clean_latent=clean_latent,
-            initial_latent=image_latent
+            initial_latent=image_latent,
+            loss_weight=loss_weight,
         )
         self.generator_optimizer.zero_grad()
         generator_loss.backward()
@@ -246,6 +275,8 @@ class Trainer:
             "generator_loss": generator_loss.item(),
             "generator_grad_norm": generator_grad_norm.item(),
         }
+        if "element_weight_mean" in log_dict:
+            wandb_loss_dict["element_weight_mean"] = log_dict["element_weight_mean"].item()
 
         # Step 4: Logging
         if self.is_main_process:

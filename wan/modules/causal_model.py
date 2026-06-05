@@ -4,6 +4,7 @@ from wan.modules.model import (
     rope_apply,
     WanLayerNorm,
     WAN_CROSSATTENTION_CLASSES,
+    WanCrossAttention,
     rope_params,
     MLPProj,
     sinusoidal_embedding_1d
@@ -277,6 +278,7 @@ class CausalWanAttentionBlock(nn.Module):
                                                                       (-1, -1),
                                                                       qk_norm,
                                                                       eps)
+        self.condition_cross_attn = None
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -298,7 +300,9 @@ class CausalWanAttentionBlock(nn.Module):
         kv_cache=None,
         crossattn_cache=None,
         current_start=0,
-        cache_start=None
+        cache_start=None,
+        condition_tokens=None,
+        condition_mask=None,
     ):
         r"""
         Args:
@@ -327,6 +331,14 @@ class CausalWanAttentionBlock(nn.Module):
         def cross_attn_ffn(x, context, context_lens, e, crossattn_cache=None):
             x = x + self.cross_attn(self.norm3(x), context,
                                     context_lens, crossattn_cache=crossattn_cache)
+            if self.condition_cross_attn is not None and condition_tokens is not None:
+                x = x + self.condition_cross_attn(
+                    self.norm3(x),
+                    condition_tokens,
+                    condition_mask,
+                    num_frames=num_frames,
+                    frame_seqlen=frame_seqlen,
+                )
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
                  frame_seqlen)) * (1 + e[4]) + e[3]).flatten(1, 2)
@@ -725,7 +737,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
-        cache_start: int = 0
+        cache_start: int = 0,
+        condition_tokens=None,
+        condition_mask=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -806,7 +820,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask
+            block_mask=self.block_mask,
+            condition_tokens=condition_tokens,
+            condition_mask=condition_mask,
         )
 
         def create_custom_forward(module):
@@ -855,6 +871,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        condition_tokens=None,
+        condition_mask=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -977,7 +995,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=self.block_mask,
+            condition_tokens=condition_tokens,
+            condition_mask=condition_mask)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -1003,6 +1023,26 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # unpatchify
         x = self.unpatchify(x, grid_sizes)
         return torch.stack(x)
+
+    def add_condition_cross_attention(
+        self,
+        condition_dim=1024,
+        dropout=0.0,
+    ):
+        for block in self.blocks:
+            block.condition_cross_attn = WanCrossAttention(
+                self.dim,
+                self.num_heads,
+                condition_dim=condition_dim,
+                qk_norm=self.qk_norm,
+                eps=self.eps,
+                dropout=dropout,
+            )
+
+    def set_condition_cross_attention_requires_grad(self, requires_grad=True):
+        for block in self.blocks:
+            if block.condition_cross_attn is not None:
+                block.condition_cross_attn.requires_grad_(requires_grad)
 
     def forward(
         self,

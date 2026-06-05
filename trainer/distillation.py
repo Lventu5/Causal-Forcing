@@ -2,6 +2,12 @@ import gc
 import logging
 from utils.dataset import cycle
 from utils.dataset import TextDataset
+from utils.ui_sim_conditioning import attach_ui_batch_conditioning
+from utils.ui_sim_dataset import build_training_dataset
+from utils.ui_sim_element_loss import (
+    build_element_loss_weighter,
+    build_element_loss_weight_map,
+)
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import set_seed
 import torch.distributed as dist
@@ -58,6 +64,10 @@ class Trainer:
             self.model = DMD(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
+        self.element_loss_weighter = build_element_loss_weighter(
+            config,
+            is_main_process=self.is_main_process,
+        )
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
@@ -115,14 +125,17 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = TextDataset(config.data_path)
+        if str(getattr(config, "dataset_type", "text")) == "ui_sim_latent":
+            dataset = build_training_dataset(config)
+        else:
+            dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=8)
+            num_workers=int(getattr(config, "num_workers", 8)))
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -171,9 +184,12 @@ class Trainer:
                         k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
                     fixed[k] = v
                 state_dict = fixed
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
+            strict = not bool(getattr(config, "allow_partial_generator_load", False))
+            load_result = self.model.generator.load_state_dict(
+                state_dict, strict=strict
             )
+            if self.is_main_process and not strict:
+                print(f"Generator load result: {load_result}")
 
         ##############################################################################################################
 
@@ -234,10 +250,17 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
+        if clean_latent is None and "clean_latent" in batch:
+            clean_latent = batch["clean_latent"].to(device=self.device, dtype=self.dtype)
         if self.config.i2v:
-            # clean_latent = None #original code here
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
-                device=self.device, dtype=self.dtype)
+            if "ode_latent" in batch:
+                image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
+                    device=self.device, dtype=self.dtype)
+            elif clean_latent is not None:
+                image_latent = clean_latent[:, 0:1, ].to(
+                    device=self.device, dtype=self.dtype)
+            else:
+                raise KeyError("I2V distillation requires ode_latent or clean_latent in the batch.")
         else:
             # clean_latent = None #original code here
             image_latent = None
@@ -259,6 +282,31 @@ class Trainer:
                 self.unconditional_dict = unconditional_dict  # cache the unconditional_dict
             else:
                 unconditional_dict = self.unconditional_dict
+        if clean_latent is not None:
+            num_latent_frames = clean_latent.shape[1]
+        elif self.config.i2v and image_latent is not None:
+            num_latent_frames = int(self.config.image_or_video_shape[1])
+        else:
+            num_latent_frames = int(self.config.image_or_video_shape[1])
+        conditional_dict, unconditional_dict = attach_ui_batch_conditioning(
+            batch,
+            conditional_dict,
+            unconditional_dict,
+            device=self.device,
+            dtype=self.dtype,
+            num_latent_frames=num_latent_frames,
+            i2v=bool(getattr(self.config, "i2v", False)),
+        )
+        loss_weight = (
+            build_element_loss_weight_map(
+                self.element_loss_weighter,
+                batch,
+                clean_latent,
+                device=self.device,
+            )
+            if clean_latent is not None
+            else None
+        )
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -267,7 +315,8 @@ class Trainer:
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
                 clean_latent=clean_latent,
-                initial_latent=image_latent if self.config.i2v else None
+                initial_latent=image_latent if self.config.i2v else None,
+                loss_weight=loss_weight,
             )
            
             generator_loss.backward()
@@ -352,6 +401,10 @@ class Trainer:
                             "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                         }
                     )
+                    if "element_weight_mean" in generator_log_dict:
+                        wandb_loss_dict["element_weight_mean"] = (
+                            generator_log_dict["element_weight_mean"].mean().item()
+                        )
 
                 wandb_loss_dict.update(
                     {
