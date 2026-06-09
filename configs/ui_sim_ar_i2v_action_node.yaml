@@ -48,6 +48,7 @@ model_kwargs:
     freeze_backbone: true
     action_dropout: 0.10
     node_dropout: 0.10
+    node_attention_dropout: 0.0
 
 teacher_forcing: true
 load_raw_video: false

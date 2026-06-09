@@ -1,7 +1,7 @@
 import gc
 import logging
 from utils.dataset import cycle
-from utils.ui_sim_conditioning import attach_ui_batch_conditioning
+from utils.ui_sim_conditioning import attach_ui_batch_conditioning, ui_conditioning_dropout_kwargs
 from utils.ui_sim_dataset import build_training_dataset
 from utils.ui_sim_element_loss import (
     build_element_loss_weighter,
@@ -248,6 +248,7 @@ class Trainer:
             dtype=self.dtype,
             num_latent_frames=clean_latent.shape[1],
             i2v=bool(getattr(self.config, "i2v", False)),
+            **ui_conditioning_dropout_kwargs(self.config),
         )
         loss_weight = build_element_loss_weight_map(
             self.element_loss_weighter,

@@ -58,6 +58,7 @@ model_kwargs:
     freeze_backbone: true
     action_dropout: 0.02
     node_dropout: 0.02
+    node_attention_dropout: 0.0
 
 real_name: ${oc.env:CF_REAL_SCORE_MODEL,Wan2.1-T2V-1.3B}
 fake_name: Wan2.1-T2V-1.3B

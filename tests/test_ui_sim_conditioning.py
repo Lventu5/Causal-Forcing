@@ -15,6 +15,7 @@ from utils.ui_sim_conditioning import (  # noqa: E402
     attach_ui_batch_conditioning,
     normalize_action_coordinates,
     unpack_packed_graph_tokens,
+    ui_conditioning_dropout_kwargs,
 )
 from utils.ui_sim_dataset import UISimLatentDataset  # noqa: E402
 from utils.ui_sim_element_loss import (  # noqa: E402
@@ -95,6 +96,54 @@ def test_attach_ui_batch_conditioning_shifts_i2v_source_rows() -> None:
     assert torch.equal(uncond["node_mask"], torch.zeros_like(cond["node_mask"]))
 
 
+def test_attach_ui_batch_conditioning_drops_node_condition_signal() -> None:
+    batch = {
+        "actions": torch.ones(1, 3, 3),
+        "node_tokens": torch.ones(1, 3, 2, 4),
+        "node_mask": torch.ones(1, 3, 2, dtype=torch.bool),
+    }
+    prompt = {"prompt_embeds": torch.ones(1, 2, 8)}
+
+    cond, uncond = attach_ui_batch_conditioning(
+        batch,
+        prompt,
+        prompt,
+        device="cpu",
+        dtype=torch.float32,
+        num_latent_frames=4,
+        i2v=True,
+        condition_dropout_enabled=True,
+        node_dropout=1.0,
+    )
+
+    assert torch.equal(cond["node_tokens"], torch.zeros_like(cond["node_tokens"]))
+    assert torch.equal(cond["node_mask"], torch.zeros_like(cond["node_mask"]))
+    assert torch.equal(uncond["node_tokens"], torch.zeros_like(cond["node_tokens"]))
+    assert torch.equal(uncond["node_mask"], torch.zeros_like(cond["node_mask"]))
+    assert torch.equal(cond["action_cond"][0, 1:], batch["actions"][0])
+
+
+def test_ui_conditioning_dropout_kwargs_only_uses_node_dropout_for_block_crossattn() -> None:
+    config = SimpleNamespace(
+        model_kwargs=SimpleNamespace(
+            ui_conditioning=SimpleNamespace(
+                enabled=True,
+                block_cross_attn=True,
+                action_dropout=0.10,
+                node_dropout=0.25,
+            )
+        )
+    )
+
+    kwargs = ui_conditioning_dropout_kwargs(config)
+
+    assert kwargs == {
+        "condition_dropout_enabled": True,
+        "action_dropout": 0.0,
+        "node_dropout": 0.25,
+    }
+
+
 def test_ui_sim_latent_dataset_slices_source_rows(tmp_path: Path) -> None:
     sample_path = tmp_path / "sample.pt"
     clean_latent = torch.arange(5 * 16 * 1 * 1, dtype=torch.float32).reshape(5, 16, 1, 1)
@@ -143,6 +192,53 @@ def test_ui_sim_latent_dataset_slices_source_rows(tmp_path: Path) -> None:
     assert item["node_mask"].shape == (3, 2)
     assert item["clip_metadata"]["start_frame"] == 0
     assert item["clip_metadata"]["end_frame"] == 4
+
+
+def test_ui_sim_latent_dataset_loads_referenced_node_rows(tmp_path: Path) -> None:
+    node_path = tmp_path / "traj_node_emb.pt"
+    node_values = torch.arange(6 * (2 * 4 + 2), dtype=torch.float32).reshape(6, 10)
+    node_values[:, 8:] = torch.tensor([
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+    ])
+    torch.save(node_values, node_path)
+
+    sample_path = tmp_path / "sample_ref.pt"
+    torch.save(
+        {
+            "clean_latent": torch.zeros(4, 16, 1, 1),
+            "actions": torch.zeros(3, 3),
+            "node_emb_path": str(node_path),
+            "node_emb_start": 2,
+            "metadata": {
+                "source_width": 1024,
+                "source_height": 768,
+                "action_coordinate_mode": "already_letterboxed_normalized",
+            },
+        },
+        sample_path,
+    )
+
+    config = SimpleNamespace(
+        data_path=str(sample_path),
+        image_or_video_shape=[1, 4, 16, 1, 1],
+        ui_random_clip=False,
+        ui_graph_tokens_per_frame=2,
+        ui_graph_token_dim=4,
+        ui_graph_token_has_mask=True,
+        width=832,
+        height=480,
+    )
+
+    item = UISimLatentDataset(sample_path, config)[0]
+
+    assert item["node_tokens"].shape == (3, 2, 4)
+    assert torch.equal(item["node_tokens"][0, 0], node_values[2, :4])
+    assert item["node_mask"].tolist() == [[False, True], [True, False], [True, True]]
 
 
 def test_cf_element_loss_uses_clip_metadata_and_letterbox(tmp_path: Path) -> None:

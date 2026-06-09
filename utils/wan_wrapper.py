@@ -261,6 +261,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         if ui_conditioning is not None and bool(ui_conditioning.get("enabled", False)):
             node_token_dim = int(ui_conditioning.get("node_token_dim", 1024))
             node_dropout = float(ui_conditioning.get("node_dropout", 0.0))
+            node_attention_dropout = float(ui_conditioning.get("node_attention_dropout", 0.0))
             self.block_cross_attn_enabled = bool(ui_conditioning.get("block_cross_attn", False))
             has_node_token_dim = (
                 hasattr(ui_conditioning, "__contains__")
@@ -274,7 +275,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             if self.block_cross_attn_enabled:
                 self.model.add_condition_cross_attention(
                     condition_dim=node_token_dim,
-                    dropout=node_dropout,
+                    dropout=node_attention_dropout,
                 )
             self.ui_conditioner = UIActionNodeConditioner(
                 latent_channels=int(ui_conditioning.get("latent_channels", 16)),

@@ -112,6 +112,13 @@ def _slice_source_rows(rows: torch.Tensor, *, start: int, num_frames: int) -> to
     return rows[start:start + needed]
 
 
+def _load_referenced_rows(path_value: str | Path, *, start: int, num_frames: int) -> torch.Tensor:
+    path = Path(path_value)
+    rows = torch.load(str(path), map_location="cpu", weights_only=True)
+    rows = _as_tensor(rows)
+    return _slice_source_rows(rows, start=start, num_frames=num_frames)
+
+
 class UISimLatentDataset(Dataset):
     """Latent-cache dataset for CF++ UI simulator training.
 
@@ -238,6 +245,19 @@ class UISimLatentDataset(Dataset):
         elif "node_emb" in payload or "node_cond" in payload:
             packed = _as_tensor(payload.get("node_emb", payload.get("node_cond")))
             packed = _slice_source_rows(packed, start=start, num_frames=self.num_frames)
+            tokens, mask = unpack_packed_graph_tokens(
+                packed,
+                tokens_per_frame=self.tokens_per_frame,
+                token_dim=self.graph_token_dim,
+                has_mask=self.graph_token_has_mask,
+            )
+            out["node_tokens"] = tokens
+            if mask is not None:
+                out["node_mask"] = mask
+        elif "node_emb_path" in payload or "node_cond_path" in payload:
+            node_path = payload.get("node_emb_path", payload.get("node_cond_path"))
+            node_start = int(payload.get("node_emb_start", start_frame))
+            packed = _load_referenced_rows(node_path, start=node_start, num_frames=self.num_frames)
             tokens, mask = unpack_packed_graph_tokens(
                 packed,
                 tokens_per_frame=self.tokens_per_frame,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Mapping, MutableMapping, Optional, Tuple
 
 import torch
 
@@ -168,6 +168,53 @@ def align_source_rows_to_latent_frames(
     return aligned
 
 
+def _get_config_value(value: Any, key: str, default: Any = None) -> Any:
+    if value is None:
+        return default
+    if hasattr(value, "get"):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def ui_conditioning_dropout_kwargs(config: Any) -> dict:
+    """Return train-time UI condition dropout kwargs for `attach_ui_batch_conditioning`.
+
+    Action dropout is still handled inside `UIActionNodeConditioner`, where the
+    action adapter lives. For block cross-attention, node tokens bypass that
+    adapter, so `node_dropout` is applied here as true condition dropout.
+    """
+    model_kwargs = _get_config_value(config, "model_kwargs", None)
+    ui_conditioning = _get_config_value(model_kwargs, "ui_conditioning", None)
+    if not bool(_get_config_value(ui_conditioning, "enabled", False)):
+        return {"condition_dropout_enabled": False}
+
+    block_cross_attn = bool(_get_config_value(ui_conditioning, "block_cross_attn", False))
+    node_dropout = float(_get_config_value(ui_conditioning, "node_dropout", 0.0)) if block_cross_attn else 0.0
+    return {
+        "condition_dropout_enabled": True,
+        "action_dropout": 0.0,
+        "node_dropout": node_dropout,
+    }
+
+
+def _apply_frame_condition_dropout(
+    value: torch.Tensor,
+    *,
+    p: float,
+    enabled: bool,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if not enabled or p <= 0.0:
+        return value, None
+    if p >= 1.0:
+        keep = torch.zeros(value.shape[:2], dtype=torch.bool, device=value.device)
+    else:
+        keep = torch.rand(value.shape[:2], device=value.device) >= float(p)
+    keep_view = keep
+    while keep_view.ndim < value.ndim:
+        keep_view = keep_view.unsqueeze(-1)
+    return value * keep_view.to(dtype=value.dtype), keep
+
+
 def attach_ui_batch_conditioning(
     batch: Mapping[str, object],
     conditional_dict: Mapping[str, torch.Tensor],
@@ -177,6 +224,9 @@ def attach_ui_batch_conditioning(
     dtype: torch.dtype,
     num_latent_frames: int,
     i2v: bool,
+    condition_dropout_enabled: bool = False,
+    action_dropout: float = 0.0,
+    node_dropout: float = 0.0,
 ) -> Tuple[MutableMapping[str, torch.Tensor], MutableMapping[str, torch.Tensor]]:
     """Attach action/node tensors from a dataloader batch to CF condition dicts."""
     cond: MutableMapping[str, torch.Tensor] = dict(conditional_dict)
@@ -189,6 +239,11 @@ def attach_ui_batch_conditioning(
             num_latent_frames=num_latent_frames,
             i2v=i2v,
         )
+        actions, _ = _apply_frame_condition_dropout(
+            actions,
+            p=action_dropout,
+            enabled=condition_dropout_enabled,
+        )
         cond["action_cond"] = actions
         uncond["action_cond"] = torch.zeros_like(actions)
 
@@ -199,8 +254,6 @@ def attach_ui_batch_conditioning(
             num_latent_frames=num_latent_frames,
             i2v=i2v,
         )
-        cond["node_tokens"] = node_tokens
-        uncond["node_tokens"] = torch.zeros_like(node_tokens)
 
         if "node_mask" in batch:
             node_mask = torch.as_tensor(batch["node_mask"], device=device)
@@ -213,7 +266,17 @@ def attach_ui_batch_conditioning(
             node_mask = torch.ones(node_tokens.shape[:-1], dtype=torch.bool, device=device)
             node_mask[:, 0] = False if i2v else node_mask[:, 0]
 
+        node_tokens, node_keep = _apply_frame_condition_dropout(
+            node_tokens,
+            p=node_dropout,
+            enabled=condition_dropout_enabled,
+        )
+        if node_keep is not None:
+            node_mask = node_mask & node_keep.unsqueeze(-1)
+
+        cond["node_tokens"] = node_tokens
         cond["node_mask"] = node_mask
+        uncond["node_tokens"] = torch.zeros_like(node_tokens)
         uncond["node_mask"] = torch.zeros_like(node_mask)
 
     return cond, uncond
