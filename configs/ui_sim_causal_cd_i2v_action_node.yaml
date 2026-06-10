@@ -3,6 +3,17 @@ dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
 generator_ckpt: ${oc.env:CF_UI_STAGE1_ACTION_NODE_CKPT,checkpoints/ui_sim/action_node_stage1/model.pt}
 allow_partial_generator_load: false
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+seed: 0
+sharding_strategy: hybrid_full
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+total_batch_size: 8
 
 i2v: true
 is_causal: true
