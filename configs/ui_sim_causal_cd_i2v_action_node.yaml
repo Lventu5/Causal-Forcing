@@ -47,7 +47,6 @@ model_kwargs:
     latent_channels: 16
     hidden_dim: 256
     block_cross_attn: true
-    freeze_backbone: true
     action_dropout: 0.05
     node_dropout: 0.05
     node_attention_dropout: 0.0
@@ -60,7 +59,7 @@ num_train_timestep: 1000
 discrete_cd_N: 48
 timestep_shift: 5.0
 guidance_scale: 3.0
-lr: 1.0e-4
+lr: 2.0e-6
 weight_decay: 0.01
 batch_size: 1
 num_workers: 8

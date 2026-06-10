@@ -1,12 +1,10 @@
-trainer: score_distillation
-distribution_loss: dmd
+trainer: diffusion
 dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
-generator_ckpt: ${oc.env:CF_UI_STAGE2_ACTION_NODE_CKPT,checkpoints/ui_sim/action_node_stage2/model.pt}
-allow_partial_generator_load: false
+generator_ckpt: ${oc.env:CF_UI_STAGE1_ACTION_CKPT,checkpoints/ui_sim/action_stage1/model.pt}
+allow_partial_generator_load: true
 
 i2v: true
-causal: true
 independent_first_frame: false
 num_frame_per_block: 1
 num_training_frames: 21
@@ -14,14 +12,6 @@ image_or_video_shape: [1, 21, 16, 60, 104]
 height: 480
 width: 832
 num_frames: 21
-
-denoising_step_list: [1000, 500]
-denoising_step_list_first_chunk: [1000, 750, 500, 250]
-warp_denoising_step: true
-same_step_across_blocks: true
-last_step_only: false
-backward_simulation: true
-context_noise: 0
 
 ui_prompt: desktop file manager UI transition
 ui_source_width: 1024
@@ -55,30 +45,25 @@ model_kwargs:
     latent_channels: 16
     hidden_dim: 256
     block_cross_attn: true
-    action_dropout: 0.02
-    node_dropout: 0.02
+    freeze_backbone: true
+    condition_cross_attn_only: true
+    action_dropout: 0.0
+    node_dropout: 0.10
     node_attention_dropout: 0.0
 
-real_name: ${oc.env:CF_REAL_SCORE_MODEL,Wan2.1-T2V-14B}
-fake_name: Wan2.1-T2V-1.3B
+teacher_forcing: true
 load_raw_video: false
 gradient_checkpointing: true
 mixed_precision: true
 num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0
-real_guidance_scale: 3.0
-fake_guidance_scale: 0.0
-denoising_loss_type: flow
-ts_schedule: false
-lr: 2.0e-6
-lr_critic: 4.0e-7
+lr: 1.0e-4
 weight_decay: 0.01
-dfake_gen_update_ratio: 5
 batch_size: 1
 num_workers: 8
 ema_weight: 0.99
-ema_start_step: 200
-log_iters: 250
+ema_start_step: 2000000000
+log_iters: 1000
 disable_wandb: true
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

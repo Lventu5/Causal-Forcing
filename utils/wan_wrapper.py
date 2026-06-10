@@ -258,6 +258,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.node_conditioning_enabled = False
         self.block_cross_attn_enabled = False
         self.train_ui_conditioner_only = False
+        self.train_condition_cross_attn_only = False
         if ui_conditioning is not None and bool(ui_conditioning.get("enabled", False)):
             node_token_dim = int(ui_conditioning.get("node_token_dim", 1024))
             node_dropout = float(ui_conditioning.get("node_dropout", 0.0))
@@ -286,13 +287,24 @@ class WanDiffusionWrapper(torch.nn.Module):
                 node_dropout=node_dropout,
                 use_node_cross_attn=self.node_conditioning_enabled and not self.block_cross_attn_enabled,
             )
-            self.train_ui_conditioner_only = bool(ui_conditioning.get("freeze_backbone", False))
+            self.train_condition_cross_attn_only = bool(
+                ui_conditioning.get("condition_cross_attn_only", False)
+            )
+            if self.train_condition_cross_attn_only and not self.block_cross_attn_enabled:
+                raise ValueError("condition_cross_attn_only requires block_cross_attn=true.")
+            self.train_ui_conditioner_only = (
+                bool(ui_conditioning.get("freeze_backbone", False))
+                or self.train_condition_cross_attn_only
+            )
         self.post_init()
 
     def enable_trainable_ui_conditioning_only(self) -> None:
         self.model.requires_grad_(False)
         if self.ui_conditioner is not None:
-            self.ui_conditioner.enable_trainable_parameters()
+            if self.train_condition_cross_attn_only:
+                self.ui_conditioner.requires_grad_(False)
+            else:
+                self.ui_conditioner.enable_trainable_parameters()
         set_condition_grad = getattr(self.model, "set_condition_cross_attention_requires_grad", None)
         if set_condition_grad is not None:
             set_condition_grad(True)

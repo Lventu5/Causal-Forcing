@@ -1,8 +1,8 @@
 trainer: diffusion
 dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
-generator_ckpt: ${oc.env:CF_PRETRAINED_AR_CKPT,checkpoints/framewise/ar_diffusion.pt}
-allow_partial_generator_load: true
+generator_ckpt: ${oc.env:CF_UI_NODE_CA_WARMUP_CKPT,checkpoints/ui_sim/action_node_ca_warmup/model.pt}
+allow_partial_generator_load: false
 
 i2v: true
 independent_first_frame: false
@@ -45,7 +45,6 @@ model_kwargs:
     latent_channels: 16
     hidden_dim: 256
     block_cross_attn: true
-    freeze_backbone: true
     action_dropout: 0.10
     node_dropout: 0.10
     node_attention_dropout: 0.0
@@ -57,12 +56,12 @@ mixed_precision: true
 num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0
-lr: 2.0e-4
+lr: 2.0e-6
 weight_decay: 0.01
 batch_size: 1
 num_workers: 8
 ema_weight: 0.99
-ema_start_step: 200
+ema_start_step: 2000000000
 log_iters: 1000
 disable_wandb: true
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

@@ -50,11 +50,10 @@ model_kwargs:
     action_dim: 3
     latent_channels: 16
     hidden_dim: 256
-    freeze_backbone: true
     action_dropout: 0.02
     node_dropout: 0.0
 
-real_name: ${oc.env:CF_REAL_SCORE_MODEL,Wan2.1-T2V-1.3B}
+real_name: ${oc.env:CF_REAL_SCORE_MODEL,Wan2.1-T2V-14B}
 fake_name: Wan2.1-T2V-1.3B
 load_raw_video: false
 gradient_checkpointing: true
@@ -66,14 +65,14 @@ real_guidance_scale: 3.0
 fake_guidance_scale: 0.0
 denoising_loss_type: flow
 ts_schedule: false
-lr: 5.0e-5
-lr_critic: 1.0e-5
+lr: 2.0e-6
+lr_critic: 4.0e-7
 weight_decay: 0.01
 dfake_gen_update_ratio: 5
 batch_size: 1
 num_workers: 8
 ema_weight: 0.99
 ema_start_step: 200
-log_iters: 500
+log_iters: 250
 disable_wandb: true
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

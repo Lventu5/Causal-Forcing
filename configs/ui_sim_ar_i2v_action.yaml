@@ -40,7 +40,6 @@ model_kwargs:
     action_dim: 3
     latent_channels: 16
     hidden_dim: 256
-    freeze_backbone: true
     action_dropout: 0.10
     node_dropout: 0.0
 
@@ -51,12 +50,12 @@ mixed_precision: true
 num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0
-lr: 2.0e-4
+lr: 2.0e-6
 weight_decay: 0.01
 batch_size: 1
 num_workers: 8
 ema_weight: 0.99
-ema_start_step: 200
+ema_start_step: 2000000000
 log_iters: 1000
 disable_wandb: true
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome
