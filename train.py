@@ -28,10 +28,12 @@ def main():
     config.no_visualize = args.no_visualize
     config.tf = args.tf 
     # get the filename of config_path
-    config_name = os.path.basename(args.config_path).split(".")[0]
+    config_name = os.environ.get("WANDB_NAME") or os.environ.get("RUN_NAME")
+    if not config_name:
+        config_name = os.path.basename(args.config_path).split(".")[0]
     config.config_name = config_name
     config.logdir = args.logdir
-    config.wandb_save_dir = args.wandb_save_dir
+    config.wandb_save_dir = args.wandb_save_dir or os.environ.get("WANDB_SAVE_DIR", "")
     config.disable_wandb = args.disable_wandb or bool(getattr(config, "disable_wandb", False))
 
     if config.trainer == "diffusion":

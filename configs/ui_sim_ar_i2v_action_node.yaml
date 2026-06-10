@@ -63,5 +63,4 @@ num_workers: 8
 ema_weight: 0.99
 ema_start_step: 2000000000
 log_iters: 1000
-disable_wandb: true
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

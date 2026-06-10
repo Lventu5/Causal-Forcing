@@ -13,12 +13,12 @@ from utils.misc import (
     merge_dict_list
 )
 import torch.distributed as dist
-from omegaconf import OmegaConf
 import torch
 import wandb
 import time
 import os
 from model import NaiveConsistency
+from utils.wandb_logging import init_wandb
 
 
 
@@ -50,15 +50,7 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
+            init_wandb(config)
 
         self.output_path = config.logdir
 
