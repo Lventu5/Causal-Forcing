@@ -288,7 +288,8 @@ class Trainer:
             batch = next(self.dataloader)
             self.train_one_step(batch)
                 
-            if (not self.config.no_save) and self.step % self.config.log_iters == 0:
+            save_iters = getattr(self.config, "save_iters", self.config.log_iters)
+            if (not self.config.no_save) and self.step % save_iters == 0:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()

@@ -59,5 +59,6 @@ batch_size: 1
 num_workers: 8
 ema_weight: 0.99
 ema_start_step: 200
-log_iters: 1000
+log_iters: 10
+save_iters: 1000
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome
