@@ -97,7 +97,15 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x).type_as(x)
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            weight,
+            bias,
+            self.eps,
+        ).type_as(x)
 
 
 class WanSelfAttention(nn.Module):
@@ -634,9 +642,9 @@ class MLPProj(torch.nn.Module):
         super().__init__()
 
         self.proj = torch.nn.Sequential(
-            torch.nn.LayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
+            WanLayerNorm(in_dim, eps=1e-5, elementwise_affine=True), torch.nn.Linear(in_dim, in_dim),
             torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
-            torch.nn.LayerNorm(out_dim))
+            WanLayerNorm(out_dim, eps=1e-5, elementwise_affine=True))
 
     def forward(self, image_embeds):
         clip_extra_context_tokens = self.proj(image_embeds)

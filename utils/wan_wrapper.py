@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
@@ -12,6 +13,19 @@ from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
+
+
+class FP32LayerNorm(nn.LayerNorm):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+        return F.layer_norm(
+            x.float(),
+            self.normalized_shape,
+            weight,
+            bias,
+            self.eps,
+        ).to(dtype=x.dtype)
 
 
 def _resolve_wan_model_dir(model_name: str, model_root: Optional[str] = None) -> Path:
@@ -44,7 +58,7 @@ class UIActionNodeConditioner(nn.Module):
         self.use_node_cross_attn = bool(use_node_cross_attn)
 
         self.action_proj = nn.Sequential(
-            nn.LayerNorm(self.action_dim),
+            FP32LayerNorm(self.action_dim),
             nn.Linear(self.action_dim, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, latent_channels),
@@ -85,13 +99,21 @@ class UIActionNodeConditioner(nn.Module):
         dtype = latents.dtype
 
         if action_cond is not None:
-            action_cond = self._drop_frame_condition(action_cond.to(dtype=latents.dtype), self.action_dropout)
-            action_bias = self.action_proj(action_cond.float()).to(dtype=dtype)
+            action_dtype = self.action_proj[1].weight.dtype
+            action_cond = self._drop_frame_condition(
+                action_cond.to(device=latents.device, dtype=action_dtype),
+                self.action_dropout,
+            )
+            action_bias = self.action_proj(action_cond).to(dtype=dtype)
             out = out + torch.tanh(self.action_gate).to(dtype=dtype) * action_bias[..., None, None]
 
         if self.use_node_cross_attn and node_tokens is not None:
             bsz, frames, channels, height, width = out.shape
-            tokens = self._drop_frame_condition(node_tokens.to(dtype=latents.dtype), self.node_dropout)
+            node_dtype = self.q_proj.weight.dtype
+            tokens = self._drop_frame_condition(
+                node_tokens.to(device=latents.device, dtype=node_dtype),
+                self.node_dropout,
+            )
             tokens = tokens.reshape(bsz * frames, tokens.shape[-2], tokens.shape[-1])
 
             if node_mask is None:
@@ -106,12 +128,12 @@ class UIActionNodeConditioner(nn.Module):
                     tokens[empty] = 0
 
             spatial = out.permute(0, 1, 3, 4, 2).reshape(bsz * frames, height * width, channels)
-            query = self.q_proj(spatial.float())
-            key = self.k_proj(tokens.float())
-            value = self.v_proj(tokens.float())
-            score = torch.bmm(query, key.transpose(1, 2)) / math.sqrt(float(self.hidden_dim))
+            query = self.q_proj(spatial.to(dtype=node_dtype))
+            key = self.k_proj(tokens)
+            value = self.v_proj(tokens)
+            score = torch.bmm(query.float(), key.float().transpose(1, 2)) / math.sqrt(float(self.hidden_dim))
             score = score.masked_fill(~mask[:, None, :], torch.finfo(score.dtype).min)
-            attn = torch.softmax(score, dim=-1)
+            attn = torch.softmax(score, dim=-1).to(dtype=node_dtype)
             attended = torch.bmm(attn, value)
             residual = self.node_out(attended).to(dtype=dtype)
             residual = residual.reshape(bsz, frames, height, width, channels).permute(0, 1, 4, 2, 3)
@@ -316,7 +338,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
         self._cls_pred_branch = nn.Sequential(
             # Input: [B, 384, 21, 60, 104]
-            nn.LayerNorm(atten_dim * 3 + time_embed_dim),
+            FP32LayerNorm(atten_dim * 3 + time_embed_dim),
             nn.Linear(atten_dim * 3 + time_embed_dim, 1536),
             nn.SiLU(),
             nn.Linear(atten_dim, num_class)

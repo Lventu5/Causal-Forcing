@@ -5,7 +5,7 @@ from torch import nn
 
 from utils.scheduler import SchedulerInterface, FlowMatchScheduler
 from wan.modules.tokenizers import HuggingfaceTokenizer
-from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock
+from wan.modules.model import WanModel, RegisterTokens, GanAttentionBlock, WanLayerNorm
 from wan.modules.vae import _video_vae
 from wan.modules.t5 import umt5_xxl
 from wan.modules.causal_model import CausalWanModel
@@ -148,7 +148,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         # NOTE: This is hard coded for WAN2.1-T2V-1.3B for now!!!!!!!!!!!!!!!!!!!!
         self._cls_pred_branch = nn.Sequential(
             # Input: [B, 384, 21, 60, 104]
-            nn.LayerNorm(atten_dim * 3 + time_embed_dim),
+            WanLayerNorm(atten_dim * 3 + time_embed_dim, eps=1e-5, elementwise_affine=True),
             nn.Linear(atten_dim * 3 + time_embed_dim, 1536),
             nn.SiLU(),
             nn.Linear(atten_dim, num_class)
