@@ -49,13 +49,13 @@ class UIActionNodeConditioner(nn.Module):
             nn.SiLU(),
             nn.Linear(self.hidden_dim, latent_channels),
         )
-        self.action_gate = nn.Parameter(torch.tensor(1e-3))
+        self.action_gate = nn.Parameter(torch.full((1,), 1e-3))
 
         self.q_proj = nn.Linear(latent_channels, self.hidden_dim)
         self.k_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
         self.v_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
         self.node_out = nn.Linear(self.hidden_dim, latent_channels)
-        self.node_gate = nn.Parameter(torch.tensor(1e-3))
+        self.node_gate = nn.Parameter(torch.full((1,), 1e-3))
 
     def enable_trainable_parameters(self) -> None:
         self.requires_grad_(True)

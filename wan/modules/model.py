@@ -299,7 +299,7 @@ class WanCrossAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
-        self.gate = nn.Parameter(torch.tensor(1e-3))
+        self.gate = nn.Parameter(torch.full((1,), 1e-3))
 
         nn.init.xavier_uniform_(self.q.weight)
         nn.init.xavier_uniform_(self.k.weight)
