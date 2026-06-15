@@ -8,14 +8,29 @@ from utils.ui_sim_element_loss import (
     build_element_loss_weighter,
     build_element_loss_weight_map,
 )
-from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from utils.distributed import (
+    EMA_FSDP,
+    fsdp_optim_state_dict,
+    fsdp_state_dict,
+    fsdp_wrap,
+    launch_distributed_job,
+    load_fsdp_optim_state_dict,
+)
 from utils.misc import set_seed
+from utils.training_checkpoint import (
+    atomic_torch_save,
+    checkpoint_metadata,
+    extract_generator_state,
+    load_checkpoint,
+    load_trainer_payload,
+)
 import torch.distributed as dist
 from model import DMD
 import torch
 import wandb
 import time
 import os
+from pathlib import Path
 from utils.wandb_logging import init_wandb
 
 
@@ -147,47 +162,99 @@ class Trainer:
 
             renamed_n = rename_param(n)
             self.name_to_trainable_params[renamed_n] = p
-        ema_weight = config.ema_weight
-        self.generator_ema = None
-        if (ema_weight is not None) and (ema_weight > 0.0):
-            print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
-
         ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
+        # 7. Load the previous-stage initializer or resume this DMD stage.
+        self.training_stage = str(getattr(config, "training_stage", ""))
+        self.initialization_checkpoint = None
+        checkpoint = None
+        trainer_payload = None
+        generator_state = None
+        strict = not bool(getattr(config, "allow_partial_generator_load", False))
         if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-                fixed = {}
-                for k, v in state_dict.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            elif "generator_ema" in state_dict:
-                gen_sd = state_dict["generator_ema"]
-                fixed = {}
-                for k, v in gen_sd.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            strict = not bool(getattr(config, "allow_partial_generator_load", False))
+            checkpoint = load_checkpoint(
+                config.generator_ckpt,
+                current_stage=self.training_stage,
+                checkpoint_mode=str(getattr(config, "checkpoint_mode", "auto")),
+            )
+            print(
+                f"Loading generator from {checkpoint.model_path} "
+                f"with checkpoint mode {checkpoint.mode}"
+            )
+            generator_state = extract_generator_state(
+                checkpoint.payload,
+                for_resume=checkpoint.is_resume,
+            )
             load_result = self.model.generator.load_state_dict(
-                state_dict, strict=strict
+                generator_state,
+                strict=strict,
             )
             if self.is_main_process and not strict:
                 print(f"Generator load result: {load_result}")
+            if checkpoint.is_resume:
+                self.step = checkpoint.step
+                self.initialization_checkpoint = checkpoint.initialization_checkpoint
+                trainer_payload = load_trainer_payload(checkpoint)
+            else:
+                self.initialization_checkpoint = str(checkpoint.model_path)
+
+        if (
+            checkpoint is not None
+            and checkpoint.is_resume
+            and trainer_payload is not None
+            and "critic" in trainer_payload
+        ):
+            self.model.fake_score.load_state_dict(
+                trainer_payload["critic"],
+                strict=True,
+            )
+
+        ema_weight = config.ema_weight
+        self.generator_ema = None
+        if (
+            (ema_weight is not None)
+            and (ema_weight > 0.0)
+            and self.step >= config.ema_start_step
+        ):
+            ema_state = (
+                extract_generator_state(checkpoint.payload, for_resume=False)
+                if checkpoint is not None
+                and checkpoint.is_resume
+                and "generator_ema" in checkpoint.payload
+                else generator_state
+            )
+            if ema_state is not None:
+                self.model.generator.load_state_dict(ema_state, strict=strict)
+            print(f"Setting up EMA with weight {ema_weight}")
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            if generator_state is not None:
+                self.model.generator.load_state_dict(generator_state, strict=strict)
+
+        if checkpoint is not None and checkpoint.is_resume:
+            if trainer_payload is not None and {
+                "generator_optimizer",
+                "critic_optimizer",
+                "critic",
+            }.issubset(trainer_payload):
+                load_fsdp_optim_state_dict(
+                    self.model.generator,
+                    self.generator_optimizer,
+                    trainer_payload["generator_optimizer"],
+                )
+                load_fsdp_optim_state_dict(
+                    self.model.fake_score,
+                    self.critic_optimizer,
+                    trainer_payload["critic_optimizer"],
+                )
+                if self.is_main_process:
+                    print(f"Resumed optimizers, critic, and global step {self.step}")
+            elif self.is_main_process:
+                print(
+                    "WARNING: legacy checkpoint has no complete trainer.pt; resumed "
+                    f"generator weights and global step {self.step}, but reinitialized "
+                    "DMD critic/optimizer state."
+                )
 
         ##############################################################################################################
-
-        # Let's delete EMA params for early steps to save some computes at training and inference
-        if self.step < config.ema_start_step:
-            self.generator_ema = None
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
@@ -195,27 +262,49 @@ class Trainer:
 
     def save(self):
         print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
-        critic_state_dict = fsdp_state_dict(
-            self.model.fake_score)
+        generator_state_dict = fsdp_state_dict(self.model.generator)
+        critic_state_dict = fsdp_state_dict(self.model.fake_score)
+        generator_optimizer_state_dict = fsdp_optim_state_dict(
+            self.model.generator,
+            self.generator_optimizer,
+        )
+        critic_optimizer_state_dict = fsdp_optim_state_dict(
+            self.model.fake_score,
+            self.critic_optimizer,
+        )
+        state_dict = checkpoint_metadata(
+            training_stage=self.training_stage,
+            step=self.step,
+            initialization_checkpoint=self.initialization_checkpoint,
+        )
+        state_dict["generator"] = generator_state_dict
+        if self.generator_ema is not None:
+            state_dict["generator_ema"] = self.generator_ema.full_state_dict(
+                self.model.generator
+            )
 
-        if self.config.ema_start_step < self.step:
-            state_dict = {
-                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
+        trainer_state_dict = checkpoint_metadata(
+            training_stage=self.training_stage,
+            step=self.step,
+            initialization_checkpoint=self.initialization_checkpoint,
+        )
+        trainer_state_dict.update(
+            {
+                "generator_optimizer": generator_optimizer_state_dict,
+                "critic": critic_state_dict,
+                "critic_optimizer": critic_optimizer_state_dict,
             }
-        else:
-            state_dict = {
-                "generator": generator_state_dict,
-            }
+        )
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            checkpoint_dir = (
+                Path(self.output_path) / f"checkpoint_model_{self.step:06d}"
+            )
+            model_path = checkpoint_dir / "model.pt"
+            trainer_path = checkpoint_dir / "trainer.pt"
+            atomic_torch_save(state_dict, model_path)
+            atomic_torch_save(trainer_state_dict, trainer_path)
+            print("Model saved to", model_path)
 
     def save_critic(self):
         print("Start gathering distributed model states...")

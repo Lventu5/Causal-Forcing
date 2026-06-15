@@ -1,4 +1,5 @@
 trainer: score_distillation
+training_stage: action_stage3_dmd
 distribution_loss: dmd
 dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
@@ -25,6 +26,7 @@ image_or_video_shape: [1, 21, 16, 60, 104]
 height: 480
 width: 832
 num_frames: 21
+vae_decode_mode: single_frame
 
 denoising_step_list: [1000, 500]
 denoising_step_list_first_chunk: [1000, 750, 500, 250]

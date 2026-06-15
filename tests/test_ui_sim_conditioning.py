@@ -22,7 +22,8 @@ from utils.ui_sim_element_loss import (  # noqa: E402
     build_element_loss_weighter,
     build_element_loss_weight_map,
 )
-from utils.wan_wrapper import UIActionNodeConditioner  # noqa: E402
+from utils.ui_sim_visualization import UISimTrainingVisualizer  # noqa: E402
+from utils.wan_wrapper import UIActionNodeConditioner, WanVAEWrapper  # noqa: E402
 from wan.modules.model import WanCrossAttention  # noqa: E402
 
 
@@ -239,6 +240,36 @@ def test_ui_sim_latent_dataset_loads_referenced_node_rows(tmp_path: Path) -> Non
     assert item["node_tokens"].shape == (3, 2, 4)
     assert torch.equal(item["node_tokens"][0, 0], node_values[2, :4])
     assert item["node_mask"].tolist() == [[False, True], [True, False], [True, True]]
+
+
+def test_wan_vae_framewise_decode_preserves_latent_frame_count() -> None:
+    vae = WanVAEWrapper.__new__(WanVAEWrapper)
+    torch.nn.Module.__init__(vae)
+    observed_shapes = []
+
+    def fake_decode(latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+        observed_shapes.append((tuple(latent.shape), use_cache))
+        return latent[:, :, :3]
+
+    vae.decode_to_pixel = fake_decode
+    latent = torch.randn(2, 4, 16, 3, 5)
+
+    decoded = vae.decode_framewise_to_pixel(latent)
+
+    assert observed_shapes == [((8, 1, 16, 3, 5), False)]
+    assert decoded.shape == (2, 4, 3, 3, 5)
+
+
+def test_ui_training_visualizer_intervals() -> None:
+    visualizer = UISimTrainingVisualizer.__new__(UISimTrainingVisualizer)
+    visualizer.enabled = True
+    visualizer.denoising_interval = 1000
+    visualizer.rollout_interval = 5000
+
+    assert visualizer.should_log_denoising(1000)
+    assert not visualizer.should_log_denoising(1500)
+    assert visualizer.should_log_rollout(5000)
+    assert not visualizer.should_log_rollout(4000)
 
 
 def test_cf_element_loss_uses_clip_metadata_and_letterbox(tmp_path: Path) -> None:

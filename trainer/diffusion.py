@@ -10,18 +10,29 @@ from utils.ui_sim_element_loss import (
     build_element_loss_weighter,
     build_element_loss_weight_map,
 )
+from utils.ui_sim_visualization import UISimTrainingVisualizer
 import torch.distributed as dist
 import torch
 import wandb
 import time
-import os
-import math
-from utils.distributed import EMA_FSDP, barrier, fsdp_wrap, fsdp_state_dict, launch_distributed_job
-from utils.wandb_logging import init_wandb
-from pipeline import (
-    CausalDiffusionInferencePipeline,
-    CausalInferencePipeline,
+from pathlib import Path
+from utils.distributed import (
+    EMA_FSDP,
+    barrier,
+    fsdp_optim_state_dict,
+    fsdp_state_dict,
+    fsdp_wrap,
+    launch_distributed_job,
+    load_fsdp_optim_state_dict,
 )
+from utils.training_checkpoint import (
+    atomic_torch_save,
+    checkpoint_metadata,
+    extract_generator_state,
+    load_checkpoint,
+    load_trainer_payload,
+)
+from utils.wandb_logging import init_wandb
 
 class Trainer:
     def __init__(self, config):
@@ -116,86 +127,129 @@ class Trainer:
 
             renamed_n = rename_param(n)
             self.name_to_trainable_params[renamed_n] = p
-        ema_weight = config.ema_weight
-        self.generator_ema = None
-        if (ema_weight is not None) and (ema_weight > 0.0):
-            print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
-
         ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
+        # 7. Load an initializer or resume the current stage.
+        self.training_stage = str(getattr(config, "training_stage", ""))
+        self.initialization_checkpoint = None
+        checkpoint = None
+        trainer_payload = None
+        generator_state = None
+        strict = not bool(getattr(config, "allow_partial_generator_load", False))
         if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-                fixed = {}
-                for k, v in state_dict.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            elif "generator_ema" in state_dict:
-                gen_sd = state_dict["generator_ema"]
-                fixed = {}
-                for k, v in gen_sd.items():
-                    if k.startswith("model._fsdp_wrapped_module."):
-                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
-                    fixed[k] = v
-                state_dict = fixed
-            strict = not bool(getattr(config, "allow_partial_generator_load", False))
-            load_result = self.model.generator.load_state_dict(state_dict, strict=strict)
+            checkpoint = load_checkpoint(
+                config.generator_ckpt,
+                current_stage=self.training_stage,
+                checkpoint_mode=str(getattr(config, "checkpoint_mode", "auto")),
+            )
+            print(
+                f"Loading generator from {checkpoint.model_path} "
+                f"with checkpoint mode {checkpoint.mode}"
+            )
+            generator_state = extract_generator_state(
+                checkpoint.payload,
+                for_resume=checkpoint.is_resume,
+            )
+            load_result = self.model.generator.load_state_dict(
+                generator_state,
+                strict=strict,
+            )
             if self.is_main_process and not strict:
                 print(f"Generator load result: {load_result}")
+            if checkpoint.is_resume:
+                self.step = checkpoint.step
+                self.initialization_checkpoint = checkpoint.initialization_checkpoint
+                trainer_payload = load_trainer_payload(checkpoint)
+            else:
+                self.initialization_checkpoint = str(checkpoint.model_path)
+
+        ema_weight = config.ema_weight
+        self.generator_ema = None
+        if (
+            (ema_weight is not None)
+            and (ema_weight > 0.0)
+            and self.step >= config.ema_start_step
+        ):
+            ema_state = (
+                extract_generator_state(checkpoint.payload, for_resume=False)
+                if checkpoint is not None
+                and checkpoint.is_resume
+                and "generator_ema" in checkpoint.payload
+                else None
+            )
+            if ema_state is not None and generator_state is not None:
+                self.model.generator.load_state_dict(ema_state, strict=strict)
+            print(f"Setting up EMA with weight {ema_weight}")
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            if ema_state is not None and generator_state is not None:
+                self.model.generator.load_state_dict(generator_state, strict=strict)
+
+        if checkpoint is not None and checkpoint.is_resume:
+            if trainer_payload is not None and "generator_optimizer" in trainer_payload:
+                load_fsdp_optim_state_dict(
+                    self.model.generator,
+                    self.generator_optimizer,
+                    trainer_payload["generator_optimizer"],
+                )
+                if self.is_main_process:
+                    print(f"Resumed optimizer and global step {self.step}")
+            elif self.is_main_process:
+                print(
+                    "WARNING: legacy checkpoint has no trainer.pt; resumed model "
+                    f"weights and global step {self.step}, but reinitialized AdamW state."
+                )
 
         ##############################################################################################################
-
-        # Let's delete EMA params for early steps to save some computes at training and inference
-        if self.step < config.ema_start_step:
-            self.generator_ema = None
 
         self.max_grad_norm = 10.0
         self.previous_time = None
-        self.delta_mean = None
-        self.rtf_ema_ratio = getattr(self.config, "rtf_ema_ratio", 0.9) 
-        self.eval_interval = getattr(self.config, "eval_interval", 0)      # 0 => disable
-        self.eval_frames = getattr(self.config, "eval_num_output_frames", 21)
-        self.eval_init = getattr(self.config, "eval_num_init_frames", 3)
-        self.rtf_single_gpu_batch = getattr(self.config, "rtf_single_gpu_batch", 1)
-        self.given_first_chunk = getattr(self.config, "given_first_chunk", True)
-        if self.eval_interval:
-            self.pipeline = CausalDiffusionInferencePipeline(config, device=self.device)
-            self.pipeline.generator = self.model.generator
-            self.pipeline.text_encoder = self.model.text_encoder
+        self.visualizer = UISimTrainingVisualizer(
+            config=config,
+            model=self.model,
+            training_dataset=self.dataset,
+            output_path=self.output_path,
+            device=self.device,
+            dtype=self.dtype,
+            is_main_process=self.is_main_process,
+            disable_wandb=self.disable_wandb,
+        )
             
     def save(self):
         print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
+        generator_state_dict = fsdp_state_dict(self.model.generator)
+        generator_optimizer_state_dict = fsdp_optim_state_dict(
+            self.model.generator,
+            self.generator_optimizer,
+        )
 
-        if self.config.ema_start_step < self.step:
-            state_dict = {
-                "generator": generator_state_dict,
-                "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
-            }
-        else:
-            state_dict = {
-                "generator": generator_state_dict,
-            }
+        state_dict = checkpoint_metadata(
+            training_stage=self.training_stage,
+            step=self.step,
+            initialization_checkpoint=self.initialization_checkpoint,
+        )
+        state_dict["generator"] = generator_state_dict
+        if self.generator_ema is not None:
+            state_dict["generator_ema"] = self.generator_ema.full_state_dict(
+                self.model.generator
+            )
+
+        trainer_state_dict = checkpoint_metadata(
+            training_stage=self.training_stage,
+            step=self.step,
+            initialization_checkpoint=self.initialization_checkpoint,
+        )
+        trainer_state_dict["generator_optimizer"] = generator_optimizer_state_dict
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            checkpoint_dir = (
+                Path(self.output_path) / f"checkpoint_model_{self.step:06d}"
+            )
+            model_path = checkpoint_dir / "model.pt"
+            trainer_path = checkpoint_dir / "trainer.pt"
+            atomic_torch_save(state_dict, model_path)
+            atomic_torch_save(trainer_state_dict, trainer_path)
+            print("Model saved to", model_path)
 
     def train_one_step(self, batch):
-        self.log_iters = 1
-
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
 
@@ -281,7 +335,6 @@ class Trainer:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
 
-
     def train(self):
 
         while True:
@@ -295,6 +348,12 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             barrier()
+            if self.visualizer.should_log_denoising(self.step):
+                self.visualizer.log_denoising(self.step)
+                barrier()
+            if self.visualizer.should_log_rollout(self.step):
+                self.visualizer.log_rollout(self.step)
+                barrier()
             if self.is_main_process:
                 current_time = time.time()
                 if self.previous_time is None:

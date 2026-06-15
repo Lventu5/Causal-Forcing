@@ -244,6 +244,24 @@ class WanVAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
+    def decode_framewise_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode independently encoded UI latents without temporal expansion."""
+        batch_size, num_frames, channels, height, width = latent.shape
+        flattened = latent.reshape(batch_size * num_frames, 1, channels, height, width)
+        decoded = self.decode_to_pixel(flattened, use_cache=False)
+        if decoded.shape[1] != 1:
+            raise RuntimeError(
+                "Frame-wise WAN VAE decode returned "
+                f"{decoded.shape[1]} frames per latent; expected 1."
+            )
+        return decoded.reshape(
+            batch_size,
+            num_frames,
+            decoded.shape[2],
+            decoded.shape[3],
+            decoded.shape[4],
+        )
+
 
 class WanDiffusionWrapper(torch.nn.Module):
     def __init__(

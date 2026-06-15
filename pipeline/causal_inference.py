@@ -323,7 +323,10 @@ class CausalInferencePipeline(torch.nn.Module):
             self.last_generation_time = time.time() - self._gen_start_time
 
         # Step 4: Decode the output
-        video = self.vae.decode_to_pixel(output, use_cache=False)
+        if getattr(self.args, "vae_decode_mode", "video") == "single_frame":
+            video = self.vae.decode_framewise_to_pixel(output)
+        else:
+            video = self.vae.decode_to_pixel(output, use_cache=False)
         video = (video * 0.5 + 0.5).clamp(0, 1)
 
         if profile:

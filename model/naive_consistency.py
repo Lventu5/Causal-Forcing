@@ -39,23 +39,6 @@ class NaiveConsistency(BaseModel):
             self.teacher.model.num_frame_per_block = self.num_frame_per_block
             
             
-        if getattr(args, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {args.generator_ckpt}")
-            state_dict = torch.load(args.generator_ckpt, map_location="cpu")[
-                'generator']
-            strict = not bool(getattr(args, "allow_partial_generator_load", False))
-            self.generator.load_state_dict(
-                state_dict, strict=strict
-            )
-            
-            self.teacher.load_state_dict(
-                state_dict, strict=strict
-            )
-            
-            self.generator_ema.load_state_dict(
-                state_dict, strict=strict
-            )
-                         
         self.independent_first_frame = getattr(args, "independent_first_frame", False)
         if self.independent_first_frame:
             self.generator.model.independent_first_frame = True

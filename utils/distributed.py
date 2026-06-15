@@ -20,6 +20,24 @@ def fsdp_state_dict(model):
     return checkpoint
 
 
+def fsdp_optim_state_dict(model, optimizer):
+    return FSDP.full_optim_state_dict(
+        model,
+        optimizer,
+        rank0_only=True,
+    )
+
+
+def load_fsdp_optim_state_dict(model, optimizer, state_dict):
+    rank0_state_dict = state_dict if dist.get_rank() == 0 else None
+    sharded_state_dict = FSDP.scatter_full_optim_state_dict(
+        rank0_state_dict,
+        model,
+        optim=optimizer,
+    )
+    optimizer.load_state_dict(sharded_state_dict)
+
+
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None, cpu_offload=False):
     if mixed_precision:
         mixed_precision_policy = MixedPrecision(

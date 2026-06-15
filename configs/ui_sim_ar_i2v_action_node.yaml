@@ -1,4 +1,5 @@
 trainer: diffusion
+training_stage: action_node_stage1
 dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
 generator_ckpt: ${oc.env:CF_UI_NODE_CA_WARMUP_CKPT,checkpoints/ui_sim/action_node_ca_warmup/model.pt}
@@ -23,6 +24,7 @@ image_or_video_shape: [1, 21, 16, 60, 104]
 height: 480
 width: 832
 num_frames: 21
+vae_decode_mode: single_frame
 
 ui_prompt: desktop file manager UI transition
 ui_source_width: 1024
@@ -75,4 +77,11 @@ ema_weight: 0.99
 ema_start_step: 2000000000
 log_iters: 10
 save_iters: 1000
+visualize_interval: 1000
+eval_interval: 5000
+eval_num_output_frames: 9
+visualize_sample_index: 0
+visualize_seed: 0
+visualize_timestep: 500
+visualize_fps: 4
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome
