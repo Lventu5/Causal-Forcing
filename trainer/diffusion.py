@@ -51,6 +51,12 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+        self.memory_diagnostics = bool(
+            getattr(config, "memory_diagnostics", False)
+        )
+        self.memory_log_interval = int(
+            getattr(config, "memory_log_interval", 100)
+        )
 
         # use a random seed for the training
         if config.seed == 0:
@@ -77,6 +83,8 @@ class Trainer:
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.generator_fsdp_wrap_strategy
         )
+        self._log_cuda_memory("startup/after_generator_fsdp")
+        torch.cuda.empty_cache()
 
         self.model.text_encoder = fsdp_wrap(
             self.model.text_encoder,
@@ -84,8 +92,10 @@ class Trainer:
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy
         )
+        self._log_cuda_memory("startup/after_text_encoder_fsdp")
+        torch.cuda.empty_cache()
 
-        if not config.no_visualize or config.load_raw_video:
+        if config.load_raw_video:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
@@ -198,6 +208,12 @@ class Trainer:
                     f"weights and global step {self.step}, but reinitialized AdamW state."
                 )
 
+        self._log_cuda_memory("startup/after_checkpoint_load")
+        torch.cuda.empty_cache()
+        self._log_cuda_memory("startup/ready")
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self.run_start_step = self.step
+
         ##############################################################################################################
 
         self.max_grad_norm = 10.0
@@ -212,6 +228,41 @@ class Trainer:
             is_main_process=self.is_main_process,
             disable_wandb=self.disable_wandb,
         )
+
+    def _log_cuda_memory(
+        self,
+        label: str,
+        *,
+        wandb_step: int | None = None,
+        reset_peak: bool = False,
+    ) -> None:
+        if not self.memory_diagnostics:
+            return
+        gib = 1024 ** 3
+        allocated = torch.cuda.memory_allocated(self.device) / gib
+        reserved = torch.cuda.memory_reserved(self.device) / gib
+        peak_allocated = torch.cuda.max_memory_allocated(self.device) / gib
+        peak_reserved = torch.cuda.max_memory_reserved(self.device) / gib
+        if self.is_main_process:
+            print(
+                f"[cuda-memory] {label}: allocated={allocated:.2f} GiB, "
+                f"reserved={reserved:.2f} GiB, "
+                f"peak_allocated={peak_allocated:.2f} GiB, "
+                f"peak_reserved={peak_reserved:.2f} GiB",
+                flush=True,
+            )
+            if wandb_step is not None and not self.disable_wandb:
+                wandb.log(
+                    {
+                        "memory/allocated_gib": allocated,
+                        "memory/reserved_gib": reserved,
+                        "memory/peak_allocated_gib": peak_allocated,
+                        "memory/peak_reserved_gib": peak_reserved,
+                    },
+                    step=wandb_step,
+                )
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(self.device)
             
     def save(self):
         print("Start gathering distributed model states...")
@@ -334,6 +385,18 @@ class Trainer:
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
+        if (
+            self.step == self.run_start_step + 1
+            or (
+                self.memory_log_interval > 0
+                and self.step % self.memory_log_interval == 0
+            )
+        ):
+            self._log_cuda_memory(
+                "training",
+                wandb_step=self.step,
+                reset_peak=True,
+            )
 
     def train(self):
 

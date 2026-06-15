@@ -121,6 +121,22 @@ class UISimTrainingVisualizer:
             video = self.model.vae.decode_to_pixel(latents)
         return (video * 0.5 + 0.5).clamp(0, 1)
 
+    def _decode_pair(
+        self,
+        target: torch.Tensor,
+        prediction: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.model.vae.to(device=self.device, dtype=self.dtype)
+        try:
+            target_video = self._decode(target).cpu()
+            self.model.vae.model.clear_cache()
+            prediction_video = self._decode(prediction).cpu()
+            self.model.vae.model.clear_cache()
+            return target_video, prediction_video
+        finally:
+            self.model.vae.to(device="cpu")
+            torch.cuda.empty_cache()
+
     def _write_comparison(
         self,
         target: torch.Tensor,
@@ -193,8 +209,7 @@ class UISimTrainingVisualizer:
 
         if not self.is_main_process:
             return
-        target = self._decode(clean_latent)
-        prediction = self._decode(x0_prediction)
+        target, prediction = self._decode_pair(clean_latent, x0_prediction)
         output_path = self._write_comparison(
             target,
             prediction,
@@ -220,7 +235,6 @@ class UISimTrainingVisualizer:
                 },
                 step=step,
             )
-        self.model.vae.model.clear_cache()
 
     def log_rollout(self, step: int) -> None:
         if self.pipeline is None:
@@ -256,8 +270,7 @@ class UISimTrainingVisualizer:
 
         if not self.is_main_process:
             return
-        target = self._decode(clean_latent)
-        prediction = self._decode(generated_latent)
+        target, prediction = self._decode_pair(clean_latent, generated_latent)
         output_path = self._write_comparison(
             target,
             prediction,
@@ -287,4 +300,3 @@ class UISimTrainingVisualizer:
                 },
                 step=step,
             )
-        self.model.vae.model.clear_cache()

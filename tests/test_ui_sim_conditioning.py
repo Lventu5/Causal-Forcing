@@ -272,6 +272,35 @@ def test_ui_training_visualizer_intervals() -> None:
     assert not visualizer.should_log_rollout(4000)
 
 
+def test_ui_training_visualizer_offloads_vae_after_decode() -> None:
+    class FakeVAE(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+            self.model = SimpleNamespace(clear_cache=self._clear_cache)
+            self.clear_count = 0
+
+        def _clear_cache(self) -> None:
+            self.clear_count += 1
+
+        def decode_framewise_to_pixel(self, latent: torch.Tensor) -> torch.Tensor:
+            return latent[:, :, :3]
+
+    visualizer = UISimTrainingVisualizer.__new__(UISimTrainingVisualizer)
+    visualizer.config = SimpleNamespace(vae_decode_mode="single_frame")
+    visualizer.model = SimpleNamespace(vae=FakeVAE())
+    visualizer.device = torch.device("cpu")
+    visualizer.dtype = torch.float32
+    latent = torch.randn(1, 2, 16, 3, 5)
+
+    target, prediction = visualizer._decode_pair(latent, latent + 1)
+
+    assert target.device.type == "cpu"
+    assert prediction.device.type == "cpu"
+    assert visualizer.model.vae.anchor.device.type == "cpu"
+    assert visualizer.model.vae.clear_count == 2
+
+
 def test_cf_element_loss_uses_clip_metadata_and_letterbox(tmp_path: Path) -> None:
     cache_dir = tmp_path / "element_cache"
     cache_dir.mkdir()
