@@ -24,6 +24,11 @@ from utils.training_checkpoint import (
     load_checkpoint,
     load_trainer_payload,
 )
+from utils.training_utils import (
+    maybe_cache_text_encoder,
+    should_run_interval,
+    training_dataloader_kwargs,
+)
 import torch.distributed as dist
 from model import DMD
 import torch
@@ -52,6 +57,7 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+        self.log_interval = int(getattr(config, "log_iters", 1))
 
         # use a random seed for the training
         if config.seed == 0:
@@ -75,9 +81,6 @@ class Trainer:
             config,
             is_main_process=self.is_main_process,
         )
-
-        # Save pretrained model state_dicts to CPU
-        self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
@@ -110,6 +113,17 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
+        original_text_encoder = self.model.text_encoder
+        self.model.text_encoder = maybe_cache_text_encoder(
+            original_text_encoder,
+            config,
+        )
+        if self.model.text_encoder is not original_text_encoder:
+            del original_text_encoder
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.is_main_process:
+                print("Cached fixed UI text embeddings and released UMT5.")
 
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(
@@ -142,7 +156,8 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=int(getattr(config, "num_workers", 8)))
+            **training_dataloader_kwargs(config),
+        )
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -225,7 +240,11 @@ class Trainer:
             if ema_state is not None:
                 self.model.generator.load_state_dict(ema_state, strict=strict)
             print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+            self.generator_ema = EMA_FSDP(
+                self.model.generator,
+                decay=ema_weight,
+                device=getattr(config, "ema_device", "cpu"),
+            )
             if generator_state is not None:
                 self.model.generator.load_state_dict(generator_state, strict=strict)
 
@@ -258,7 +277,7 @@ class Trainer:
 
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
-        self.previous_time = None
+        self.previous_log_time = time.perf_counter()
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -329,7 +348,11 @@ class Trainer:
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         if clean_latent is None and "clean_latent" in batch:
-            clean_latent = batch["clean_latent"].to(device=self.device, dtype=self.dtype)
+            clean_latent = batch["clean_latent"].to(
+                device=self.device,
+                dtype=self.dtype,
+                non_blocking=True,
+            )
         if self.config.i2v:
             if "ode_latent" in batch:
                 image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
@@ -461,7 +484,11 @@ class Trainer:
             # Create EMA params (if not already created)
             if (self.step >= self.config.ema_start_step) and \
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
-                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+                self.generator_ema = EMA_FSDP(
+                    self.model.generator,
+                    decay=self.config.ema_weight,
+                    device=getattr(self.config, "ema_device", "cpu"),
+                )
 
             # Save the model
             save_iters = getattr(self.config, "save_iters", self.config.log_iters)
@@ -471,7 +498,11 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
-            if self.is_main_process:
+            if self.is_main_process and should_run_interval(
+                self.step,
+                self.log_interval,
+            ):
+                current_time = time.perf_counter()
                 wandb_loss_dict = {}
                 if TRAIN_GENERATOR:
                     wandb_loss_dict.update(
@@ -489,23 +520,21 @@ class Trainer:
                 wandb_loss_dict.update(
                     {
                         "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item(),
+                        "per iteration time": (
+                            current_time - self.previous_log_time
+                        ) / self.log_interval,
                     }
                 )
+                self.previous_log_time = current_time
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
 
-            if self.step % self.config.gc_interval == 0:
+            if should_run_interval(
+                self.step,
+                int(getattr(self.config, "gc_interval", 0)),
+            ):
                 if dist.get_rank() == 0:
                     logging.info("DistGarbageCollector: Running GC.")
                 gc.collect()
-
-            if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is None:
-                    self.previous_time = current_time
-                else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
-                    self.previous_time = current_time

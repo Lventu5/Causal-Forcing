@@ -107,28 +107,54 @@ def launch_distributed_job(backend: str = "nccl"):
 
 
 class EMA_FSDP:
-    def __init__(self, fsdp_module: torch.nn.Module, decay: float = 0.999):
+    def __init__(
+        self,
+        fsdp_module: torch.nn.Module,
+        decay: float = 0.999,
+        device: torch.device | str = "cpu",
+    ):
         self.decay = decay
+        self.device = self._resolve_device(device)
         self.shadow = {}
         self._init_shadow(fsdp_module)
+
+    @staticmethod
+    def _resolve_device(device: torch.device | str) -> torch.device:
+        resolved = torch.device(device)
+        if resolved.type == "cuda" and resolved.index is None:
+            resolved = torch.device("cuda", torch.cuda.current_device())
+        return resolved
 
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
         for n, p in fsdp_module.module.named_parameters():
-            self.shadow[n] = p.detach().clone().float().cpu()
+            self.shadow[n] = p.detach().to(
+                device=self.device,
+                dtype=torch.float32,
+                copy=True,
+            )
 
     @torch.no_grad()
     def update(self, fsdp_module):
         d = self.decay
         for n, p in fsdp_module.module.named_parameters():
-            self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+            source = p.detach()
+            if source.device != self.device:
+                source = source.to(device=self.device)
+            self.shadow[n].mul_(d).add_(
+                source,
+                alpha=1. - d,
+            )
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
         return self.shadow            # picklable
 
     def load_state_dict(self, sd):
-        self.shadow = {k: v.clone() for k, v in sd.items()}
+        self.shadow = {
+            k: v.to(device=self.device, dtype=torch.float32, copy=True)
+            for k, v in sd.items()
+        }
 
     def copy_to(self, fsdp_module):
         for n, p in fsdp_module.module.named_parameters():

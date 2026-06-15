@@ -358,7 +358,6 @@ class DMD(SelfForcingModel):
 
         # Step 1: Randomly choose a timestep for each frame
         uniform_timestep = tf or (not causal)
-        print(f'uniform_timestep is {uniform_timestep}')
         index = self._get_timestep(
             0,
             len(self.denoising_step_list),
@@ -367,7 +366,6 @@ class DMD(SelfForcingModel):
             self.num_frame_per_block,
             uniform_timestep=uniform_timestep
         )
-        print(f'before self._process_timestep(index), index is {index}')
         if self.args.i2v:
             index[:, 0] = len(self.denoising_step_list) - 1
 
@@ -378,7 +376,4 @@ class DMD(SelfForcingModel):
         ).squeeze(1)
 
         timestep = self.denoising_step_list[index].to(self.device)
-        print(f'index is {index}, timestep is {timestep}')
-    
-
         return noisy_input, timestep

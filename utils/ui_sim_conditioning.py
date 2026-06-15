@@ -233,7 +233,11 @@ def attach_ui_batch_conditioning(
     uncond: MutableMapping[str, torch.Tensor] = dict(unconditional_dict)
 
     if "actions" in batch:
-        actions = torch.as_tensor(batch["actions"], device=device, dtype=dtype)
+        actions = torch.as_tensor(batch["actions"]).to(
+            device=device,
+            dtype=dtype,
+            non_blocking=True,
+        )
         actions = align_source_rows_to_latent_frames(
             actions,
             num_latent_frames=num_latent_frames,
@@ -248,7 +252,11 @@ def attach_ui_batch_conditioning(
         uncond["action_cond"] = torch.zeros_like(actions)
 
     if "node_tokens" in batch:
-        node_tokens = torch.as_tensor(batch["node_tokens"], device=device, dtype=dtype)
+        node_tokens = torch.as_tensor(batch["node_tokens"]).to(
+            device=device,
+            dtype=dtype,
+            non_blocking=True,
+        )
         node_tokens = align_source_rows_to_latent_frames(
             node_tokens,
             num_latent_frames=num_latent_frames,
@@ -256,7 +264,10 @@ def attach_ui_batch_conditioning(
         )
 
         if "node_mask" in batch:
-            node_mask = torch.as_tensor(batch["node_mask"], device=device)
+            node_mask = torch.as_tensor(batch["node_mask"]).to(
+                device=device,
+                non_blocking=True,
+            )
             node_mask = align_source_rows_to_latent_frames(
                 node_mask,
                 num_latent_frames=num_latent_frames,

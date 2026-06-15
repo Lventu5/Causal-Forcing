@@ -76,8 +76,14 @@ lr: 2.0e-6
 weight_decay: 0.01
 batch_size: 1
 num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+cache_text_embeddings: true
+fsdp_cpu_offload: false
+gc_interval: 0
 ema_weight: 0.99
-ema_start_step: 200
+ema_start_step: 0
 log_iters: 10
 save_iters: 1000
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

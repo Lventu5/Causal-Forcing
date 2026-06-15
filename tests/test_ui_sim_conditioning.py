@@ -148,7 +148,7 @@ def test_ui_conditioning_dropout_kwargs_only_uses_node_dropout_for_block_crossat
 
 def test_ui_sim_latent_dataset_slices_source_rows(tmp_path: Path) -> None:
     sample_path = tmp_path / "sample.pt"
-    clean_latent = torch.arange(5 * 16 * 1 * 1, dtype=torch.float32).reshape(5, 16, 1, 1)
+    clean_latent = torch.arange(5 * 16 * 1 * 1, dtype=torch.float16).reshape(5, 16, 1, 1)
     actions = torch.tensor(
         [
             [0.0, 0.0, 0.0],
@@ -188,6 +188,7 @@ def test_ui_sim_latent_dataset_slices_source_rows(tmp_path: Path) -> None:
     item = dataset[0]
 
     assert item["clean_latent"].shape == (4, 16, 1, 1)
+    assert item["clean_latent"].dtype == clean_latent.dtype
     assert item["actions"].shape == (3, 3)
     assert torch.equal(item["actions"], actions[:3])
     assert item["node_tokens"].shape == (3, 2, 4)

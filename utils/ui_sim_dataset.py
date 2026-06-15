@@ -96,10 +96,14 @@ def _discover_samples(data_path: Path) -> List[Dict[str, Any]]:
     return samples
 
 
-def _as_tensor(value: Any, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def _as_tensor(
+    value: Any,
+    *,
+    dtype: Optional[torch.dtype] = torch.float32,
+) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
-        return value.to(dtype=dtype)
-    return torch.tensor(value, dtype=dtype)
+        return value if dtype is None else value.to(dtype=dtype)
+    return torch.as_tensor(value, dtype=dtype)
 
 
 def _slice_source_rows(rows: torch.Tensor, *, start: int, num_frames: int) -> torch.Tensor:
@@ -175,7 +179,9 @@ class UISimLatentDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         payload = self._load_payload(self.samples[idx])
 
-        clean_latent = _as_tensor(payload["clean_latent"])
+        clean_latent = _as_tensor(payload["clean_latent"], dtype=None)
+        if not clean_latent.is_floating_point():
+            clean_latent = clean_latent.float()
         if clean_latent.ndim == 5 and clean_latent.shape[0] == 1:
             clean_latent = clean_latent[0]
         if clean_latent.ndim != 4:

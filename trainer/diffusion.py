@@ -32,7 +32,13 @@ from utils.training_checkpoint import (
     load_checkpoint,
     load_trainer_payload,
 )
+from utils.training_utils import (
+    maybe_cache_text_encoder,
+    should_run_interval,
+    training_dataloader_kwargs,
+)
 from utils.wandb_logging import init_wandb
+
 
 class Trainer:
     def __init__(self, config):
@@ -57,6 +63,7 @@ class Trainer:
         self.memory_log_interval = int(
             getattr(config, "memory_log_interval", 100)
         )
+        self.log_interval = int(getattr(config, "log_iters", 1))
 
         # use a random seed for the training
         if config.seed == 0:
@@ -93,6 +100,17 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy
         )
         self._log_cuda_memory("startup/after_text_encoder_fsdp")
+        original_text_encoder = self.model.text_encoder
+        self.model.text_encoder = maybe_cache_text_encoder(
+            original_text_encoder,
+            config,
+        )
+        if self.model.text_encoder is not original_text_encoder:
+            del original_text_encoder
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.is_main_process:
+                print("Cached fixed UI text embeddings and released UMT5.")
         torch.cuda.empty_cache()
 
         if config.load_raw_video:
@@ -117,7 +135,8 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=int(getattr(config, "num_workers", 8)))
+            **training_dataloader_kwargs(config),
+        )
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -217,7 +236,7 @@ class Trainer:
         ##############################################################################################################
 
         self.max_grad_norm = 10.0
-        self.previous_time = None
+        self.previous_log_time = time.perf_counter()
         self.visualizer = UISimTrainingVisualizer(
             config=config,
             model=self.model,
@@ -305,10 +324,16 @@ class Trainer:
         text_prompts = batch["prompts"]
         if not self.config.load_raw_video:  # precomputed latent
             clean_latent = batch["clean_latent"].to(
-                device=self.device, dtype=self.dtype)
+                device=self.device,
+                dtype=self.dtype,
+                non_blocking=True,
+            )
         else:  # encode raw video to latent
             frames = batch["frames"].to(
-                device=self.device, dtype=self.dtype)
+                device=self.device,
+                dtype=self.dtype,
+                non_blocking=True,
+            )
            
             with torch.no_grad():
                 clean_latent = self.model.vae.encode_to_latent(
@@ -357,7 +382,7 @@ class Trainer:
             initial_latent=image_latent,
             loss_weight=loss_weight,
         )
-        self.generator_optimizer.zero_grad()
+        self.generator_optimizer.zero_grad(set_to_none=True)
         generator_loss.backward()
         generator_grad_norm = self.model.generator.clip_grad_norm_(
             self.max_grad_norm)
@@ -366,19 +391,31 @@ class Trainer:
         # Increment the step since we finished gradient update
         self.step += 1
 
-        wandb_loss_dict = {
-            "generator_loss": generator_loss.item(),
-            "generator_grad_norm": generator_grad_norm.item(),
-        }
-        if "element_weight_mean" in log_dict:
-            wandb_loss_dict["element_weight_mean"] = log_dict["element_weight_mean"].item()
-
         # Step 4: Logging
-        if self.is_main_process:
+        if self.is_main_process and should_run_interval(
+            self.step,
+            self.log_interval,
+        ):
+            current_time = time.perf_counter()
+            wandb_loss_dict = {
+                "generator_loss": generator_loss.item(),
+                "generator_grad_norm": generator_grad_norm.item(),
+                "per iteration time": (
+                    current_time - self.previous_log_time
+                ) / self.log_interval,
+            }
+            self.previous_log_time = current_time
+            if "element_weight_mean" in log_dict:
+                wandb_loss_dict["element_weight_mean"] = (
+                    log_dict["element_weight_mean"].item()
+                )
             if not self.disable_wandb:
                 wandb.log(wandb_loss_dict, step=self.step)
 
-        if self.step % self.config.gc_interval == 0:
+        if should_run_interval(
+            self.step,
+            int(getattr(self.config, "gc_interval", 0)),
+        ):
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
@@ -422,24 +459,17 @@ class Trainer:
                 self.save()
                 torch.cuda.empty_cache()
 
-            barrier()
             if self.visualizer.should_log_denoising(self.step):
+                barrier()
                 self._run_visualization(
                     "denoising",
                     self.visualizer.log_denoising,
                 )
                 barrier()
             if self.visualizer.should_log_rollout(self.step):
+                barrier()
                 self._run_visualization(
                     "rollout",
                     self.visualizer.log_rollout,
                 )
                 barrier()
-            if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is None:
-                    self.previous_time = current_time
-                else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
-                    self.previous_time = current_time

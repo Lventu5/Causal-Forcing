@@ -3,9 +3,8 @@ from typing import Tuple
 import torch
 import random
 from model.base import BaseModel
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
 from utils.scheduler import FlowMatchScheduler
-from pipeline import CausalDiffusionInferencePipeline
 
 
 def _cfg_get(config, key, default=None):
@@ -17,7 +16,6 @@ def _cfg_get(config, key, default=None):
 class NaiveConsistency(BaseModel):
     def __init__(self, args, device):
         super().__init__(args, device)
-        print(args)
         # Step 1: Initialize all models
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=args.is_causal)
         if getattr(self.generator, "train_ui_conditioner_only", False):
@@ -54,10 +52,6 @@ class NaiveConsistency(BaseModel):
         self.scheduler.set_timesteps(num_inference_steps=self.discrete_cd_N, denoising_strength=1.0)
         self.scheduler.sigmas = self.scheduler.sigmas.to(device)
         
-        self.pipeline = CausalDiffusionInferencePipeline(args, device=device, need_vae=False)
-        self.pipeline.generator = self.teacher
-        self.pipeline.text_encoder = self.text_encoder
-        
     def _initialize_models(self, args, device):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         if getattr(self.generator, "train_ui_conditioner_only", False):
@@ -89,7 +83,6 @@ class NaiveConsistency(BaseModel):
             conditional_dict,
             unconditional_dict,
             clean_latent,
-            ema_model,
             loss_weight=None,
         ) -> Tuple[torch.Tensor, dict]:
         
@@ -134,14 +127,11 @@ class NaiveConsistency(BaseModel):
             self.generator_ema.model._block_mask_key = self.teacher.model._block_mask_key
 
         
-        print(f't:{t}; t_next: {t_next}')
-        
         _, cm_pred_t = self.generator(
             latent_t, conditional_dict, timestep, clean_x = clean_latent
         )
 
         with torch.no_grad():
-            ema_model.copy_to(self.generator_ema)
             _, cm_pred_t_next = self.generator_ema(
                 latent_t_next, conditional_dict, timestep_next, clean_x = clean_latent
             )

@@ -8,7 +8,6 @@ from utils.ui_sim_element_loss import (
     build_element_loss_weight_map,
 )
 from utils.distributed import (
-    EMA_FSDP,
     fsdp_optim_state_dict,
     fsdp_state_dict,
     fsdp_wrap,
@@ -22,6 +21,12 @@ from utils.training_checkpoint import (
     extract_generator_state,
     load_checkpoint,
     load_trainer_payload,
+)
+from utils.training_utils import (
+    maybe_cache_text_encoder,
+    should_run_interval,
+    training_dataloader_kwargs,
+    update_ema_model,
 )
 import torch.distributed as dist
 import torch
@@ -51,6 +56,7 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+        self.log_interval = int(getattr(config, "log_iters", 1))
 
         # use a random seed for the training
         if config.seed == 0:
@@ -71,13 +77,14 @@ class Trainer:
             config,
             is_main_process=self.is_main_process,
         )
+        cpu_offload = bool(getattr(config, "fsdp_cpu_offload", False))
 
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.generator_fsdp_wrap_strategy,
-            cpu_offload=True
+            cpu_offload=cpu_offload,
         )
         
         self.model.generator_ema = fsdp_wrap(
@@ -85,7 +92,7 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.generator_fsdp_wrap_strategy,
-            cpu_offload=True
+            cpu_offload=cpu_offload,
         )
 
         self.model.teacher = fsdp_wrap(
@@ -93,7 +100,7 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.real_score_fsdp_wrap_strategy,
-            cpu_offload=True
+            cpu_offload=cpu_offload,
         )
 
         self.model.text_encoder = fsdp_wrap(
@@ -101,8 +108,21 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            cpu_offload=True
+            cpu_offload=bool(
+                getattr(config, "text_encoder_cpu_offload", cpu_offload)
+            ),
         )
+        original_text_encoder = self.model.text_encoder
+        self.model.text_encoder = maybe_cache_text_encoder(
+            original_text_encoder,
+            config,
+        )
+        if self.model.text_encoder is not original_text_encoder:
+            del original_text_encoder
+            gc.collect()
+            torch.cuda.empty_cache()
+            if self.is_main_process:
+                print("Cached fixed UI text embeddings and released UMT5.")
 
         
         self.generator_optimizer = torch.optim.AdamW(
@@ -123,7 +143,8 @@ class Trainer:
             dataset,
             batch_size=config.batch_size,
             sampler=sampler,
-            num_workers=int(getattr(config, "num_workers", 8)))
+            **training_dataloader_kwargs(config),
+        )
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -219,11 +240,14 @@ class Trainer:
             self.model.generator_ema.load_state_dict(ema_state, strict=strict)
             self.model.generator.load_state_dict(ema_state, strict=strict)
 
-        ema_weight = config.ema_weight
-        self.generator_ema = None
-        if (ema_weight is not None) and (ema_weight > 0.0):
-            print(f"Setting up EMA with weight {ema_weight}")
-            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+        self.ema_decay = float(config.ema_weight)
+        if not 0.0 < self.ema_decay < 1.0:
+            raise ValueError("Stage 2 requires ema_weight between 0 and 1.")
+        if self.is_main_process:
+            print(
+                "Using the sharded generator_ema model directly with "
+                f"decay {self.ema_decay}."
+            )
         if generator_state is not None:
             self.model.generator.load_state_dict(generator_state, strict=strict)
 
@@ -245,7 +269,7 @@ class Trainer:
         #############################################################################################################
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
-        self.previous_time = None
+        self.previous_log_time = time.perf_counter()
         
         
 
@@ -262,10 +286,9 @@ class Trainer:
             initialization_checkpoint=self.initialization_checkpoint,
         )
         state_dict["generator"] = generator_state_dict
-        if self.generator_ema is not None:
-            state_dict["generator_ema"] = self.generator_ema.full_state_dict(
-                self.model.generator
-            )
+        state_dict["generator_ema"] = fsdp_state_dict(
+            self.model.generator_ema
+        )
 
         trainer_state_dict = checkpoint_metadata(
             training_stage=self.training_stage,
@@ -329,7 +352,6 @@ class Trainer:
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             clean_latent=clean_latent,
-            ema_model=self.generator_ema,
             loss_weight=loss_weight,
         )
         generator_loss.backward()
@@ -352,12 +374,23 @@ class Trainer:
             self.generator_optimizer.zero_grad(set_to_none=True)
 
             batch = next(self.dataloader)
-            generator_log_dict = self.fwdbwd_one_step(batch, clean_latent=batch["clean_latent"])
+            clean_latent = batch["clean_latent"].to(
+                device=self.device,
+                dtype=self.dtype,
+                non_blocking=True,
+            )
+            generator_log_dict = self.fwdbwd_one_step(
+                batch,
+                clean_latent=clean_latent,
+            )
             
 
             self.generator_optimizer.step()
-            if self.generator_ema is not None:
-                self.generator_ema.update(self.model.generator)
+            update_ema_model(
+                self.model.generator_ema,
+                self.model.generator,
+                decay=self.ema_decay,
+            )
             
               
 
@@ -373,14 +406,22 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
-            if self.is_main_process:
+            if self.is_main_process and should_run_interval(
+                self.step,
+                self.log_interval,
+            ):
+                current_time = time.perf_counter()
                 wandb_loss_dict = {}
                 wandb_loss_dict.update(
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item()
+                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
+                            "per iteration time": (
+                                current_time - self.previous_log_time
+                            ) / self.log_interval,
                         }
                     )
+                self.previous_log_time = current_time
                 if "element_weight_mean" in generator_log_dict:
                     wandb_loss_dict["element_weight_mean"] = (
                         generator_log_dict["element_weight_mean"].mean().item()
@@ -391,16 +432,10 @@ class Trainer:
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
 
-            if self.step % self.config.gc_interval == 0:
+            if should_run_interval(
+                self.step,
+                int(getattr(self.config, "gc_interval", 0)),
+            ):
                 if dist.get_rank() == 0:
                     logging.info("DistGarbageCollector: Running GC.")
                 gc.collect()
-
-            if self.is_main_process:
-                current_time = time.time()
-                if self.previous_time is None:
-                    self.previous_time = current_time
-                else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
-                    self.previous_time = current_time

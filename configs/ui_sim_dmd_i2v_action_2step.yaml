@@ -84,6 +84,12 @@ weight_decay: 0.01
 dfake_gen_update_ratio: 5
 batch_size: 1
 num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+cache_text_embeddings: true
+ema_device: cuda
+gc_interval: 0
 ema_weight: 0.99
 ema_start_step: 200
 log_iters: 10

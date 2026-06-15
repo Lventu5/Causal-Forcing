@@ -67,6 +67,11 @@ lr: 2.0e-6
 weight_decay: 0.01
 batch_size: 1
 num_workers: 8
+pin_memory: true
+persistent_workers: true
+prefetch_factor: 2
+cache_text_embeddings: true
+gc_interval: 0
 ema_weight: 0.99
 ema_start_step: 2000000000
 log_iters: 10
