@@ -24,6 +24,7 @@ from utils.ui_sim_element_loss import (  # noqa: E402
 )
 from utils.ui_sim_visualization import UISimTrainingVisualizer  # noqa: E402
 from utils.wan_wrapper import UIActionNodeConditioner, WanVAEWrapper  # noqa: E402
+from wan.modules.causal_model import CausalWanModel  # noqa: E402
 from wan.modules.model import WanCrossAttention  # noqa: E402
 
 
@@ -270,6 +271,58 @@ def test_ui_training_visualizer_intervals() -> None:
     assert not visualizer.should_log_denoising(1500)
     assert visualizer.should_log_rollout(5000)
     assert not visualizer.should_log_rollout(4000)
+
+
+def test_causal_wan_rebuilds_block_mask_for_visualization_shape(
+    monkeypatch,
+) -> None:
+    model = CausalWanModel.__new__(CausalWanModel)
+    torch.nn.Module.__init__(model)
+    model.block_mask = None
+    model._block_mask_key = None
+    model.num_frame_per_block = 1
+    model.independent_first_frame = False
+    model.local_attn_size = 21
+    builds = []
+
+    def build_teacher_mask(
+        device,
+        num_frames,
+        frame_seqlen,
+        num_frame_per_block,
+    ):
+        mask = (num_frames, frame_seqlen, num_frame_per_block)
+        builds.append(mask)
+        return mask
+
+    monkeypatch.setattr(
+        CausalWanModel,
+        "_prepare_teacher_forcing_mask",
+        staticmethod(build_teacher_mask),
+    )
+
+    training_mask = model._ensure_block_mask(
+        device="cpu",
+        num_frames=21,
+        frame_seqlen=1560,
+        teacher_forcing=True,
+    )
+    reused_mask = model._ensure_block_mask(
+        device="cpu",
+        num_frames=21,
+        frame_seqlen=1560,
+        teacher_forcing=True,
+    )
+    preview_mask = model._ensure_block_mask(
+        device="cpu",
+        num_frames=9,
+        frame_seqlen=1560,
+        teacher_forcing=True,
+    )
+
+    assert reused_mask is training_mask
+    assert preview_mask != training_mask
+    assert builds == [(21, 1560, 1), (9, 1560, 1)]
 
 
 def test_ui_training_visualizer_offloads_vae_after_decode() -> None:

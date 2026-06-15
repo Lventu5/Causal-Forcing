@@ -129,7 +129,9 @@ class NaiveConsistency(BaseModel):
         # Share block_mask to avoid redundant allocation
         if self.generator.model.block_mask is None and self.teacher.model.block_mask is not None:
             self.generator.model.block_mask = self.teacher.model.block_mask
+            self.generator.model._block_mask_key = self.teacher.model._block_mask_key
             self.generator_ema.model.block_mask = self.teacher.model.block_mask
+            self.generator_ema.model._block_mask_key = self.teacher.model._block_mask_key
 
         
         print(f't:{t}; t_next: {t_next}')

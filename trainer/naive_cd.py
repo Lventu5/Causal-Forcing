@@ -288,9 +288,6 @@ class Trainer:
     def fwdbwd_one_step(self, batch, clean_latent=None):
         self.model.eval()
 
-        if self.step % 20 == 0:
-            torch.cuda.empty_cache()
-
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         batch_size = len(text_prompts)
@@ -398,7 +395,6 @@ class Trainer:
                 if dist.get_rank() == 0:
                     logging.info("DistGarbageCollector: Running GC.")
                 gc.collect()
-                torch.cuda.empty_cache()
 
             if self.is_main_process:
                 current_time = time.time()

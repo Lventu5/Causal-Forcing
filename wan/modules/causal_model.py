@@ -512,6 +512,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
         self.block_mask = None
+        self._block_mask_key = None
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
@@ -524,6 +525,68 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         gradient_checkpointing_func=None,
     ):
         self.gradient_checkpointing = bool(value if enable is None else enable)
+
+    def _ensure_block_mask(
+        self,
+        *,
+        device: torch.device | str,
+        num_frames: int,
+        frame_seqlen: int,
+        teacher_forcing: bool,
+    ) -> BlockMask:
+        device = torch.device(device)
+        if teacher_forcing:
+            mask_type = "teacher_forcing"
+            local_attn_size = -1
+        elif self.independent_first_frame:
+            mask_type = "i2v_causal"
+            local_attn_size = self.local_attn_size
+        else:
+            mask_type = "causal"
+            local_attn_size = self.local_attn_size
+
+        mask_key = (
+            mask_type,
+            device.type,
+            device.index,
+            int(num_frames),
+            int(frame_seqlen),
+            int(self.num_frame_per_block),
+            int(local_attn_size),
+        )
+        if (
+            self.block_mask is not None
+            and getattr(self, "_block_mask_key", None) == mask_key
+        ):
+            return self.block_mask
+
+        if teacher_forcing:
+            block_mask = self._prepare_teacher_forcing_mask(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+            )
+        elif self.independent_first_frame:
+            block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size,
+            )
+        else:
+            block_mask = self._prepare_blockwise_causal_attn_mask(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size,
+            )
+
+        self.block_mask = block_mask
+        self._block_mask_key = mask_key
+        return block_mask
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -908,32 +971,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
-            if clean_x is not None: # TF
-                if self.independent_first_frame:
-                    raise NotImplementedError()
-                else:
-                    self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block
-                    )
-            else: # DF?
-                if self.independent_first_frame:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
-                else:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
+        if clean_x is not None and self.independent_first_frame:
+            raise NotImplementedError()
+        frame_seqlen = (
+            x.shape[-2]
+            * x.shape[-1]
+            // (self.patch_size[1] * self.patch_size[2])
+        )
+        self._ensure_block_mask(
+            device=device,
+            num_frames=x.shape[2],
+            frame_seqlen=frame_seqlen,
+            teacher_forcing=clean_x is not None,
+        )
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]

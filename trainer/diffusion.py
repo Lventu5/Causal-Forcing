@@ -301,9 +301,6 @@ class Trainer:
             print("Model saved to", model_path)
 
     def train_one_step(self, batch):
-        if self.step % 20 == 0:
-            torch.cuda.empty_cache()
-
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
         if not self.config.load_raw_video:  # precomputed latent
@@ -398,6 +395,21 @@ class Trainer:
                 reset_peak=True,
             )
 
+    def _run_visualization(self, name, callback):
+        try:
+            callback(self.step)
+        except Exception:
+            logging.exception(
+                "Skipping failed %s visualization at step %d on rank %d.",
+                name,
+                self.step,
+                dist.get_rank(),
+            )
+            gc.collect()
+            torch.cuda.empty_cache()
+            if bool(getattr(self.config, "visualization_fail_fast", False)):
+                raise
+
     def train(self):
 
         while True:
@@ -412,10 +424,16 @@ class Trainer:
 
             barrier()
             if self.visualizer.should_log_denoising(self.step):
-                self.visualizer.log_denoising(self.step)
+                self._run_visualization(
+                    "denoising",
+                    self.visualizer.log_denoising,
+                )
                 barrier()
             if self.visualizer.should_log_rollout(self.step):
-                self.visualizer.log_rollout(self.step)
+                self._run_visualization(
+                    "rollout",
+                    self.visualizer.log_rollout,
+                )
                 barrier()
             if self.is_main_process:
                 current_time = time.time()
