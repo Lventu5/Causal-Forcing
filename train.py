@@ -4,6 +4,44 @@ from omegaconf import OmegaConf
 import wandb
 
 from trainer import DiffusionTrainer, ODETrainer, ScoreDistillationTrainer, ConsistencyDistillationTrainer
+from utils.training_checkpoint import (
+    DEFAULT_CHECKPOINT_DIR_NAME,
+    rolling_model_checkpoint_path,
+)
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _maybe_auto_resume_from_last(config) -> None:
+    if not _as_bool(getattr(config, "auto_resume_from_last", False)):
+        return
+    if not getattr(config, "logdir", ""):
+        return
+
+    checkpoint_path = rolling_model_checkpoint_path(
+        config.logdir,
+        checkpoint_dir_name=getattr(
+            config,
+            "checkpoint_dir_name",
+            DEFAULT_CHECKPOINT_DIR_NAME,
+        ),
+    )
+    if checkpoint_path is None or not checkpoint_path.exists():
+        return
+
+    previous_ckpt = str(getattr(config, "generator_ckpt", ""))
+    config.generator_ckpt = str(checkpoint_path.resolve())
+    config.checkpoint_mode = "resume"
+    print(
+        "Auto-resuming from rolling checkpoint "
+        f"{config.generator_ckpt} (initial generator_ckpt was {previous_ckpt or '<unset>'})."
+    )
 
 
 def main():
@@ -35,6 +73,7 @@ def main():
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir or os.environ.get("WANDB_SAVE_DIR", "")
     config.disable_wandb = args.disable_wandb or bool(getattr(config, "disable_wandb", False))
+    _maybe_auto_resume_from_last(config)
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)

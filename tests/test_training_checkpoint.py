@@ -10,8 +10,11 @@ if str(CF_ROOT) not in sys.path:
     sys.path.insert(0, str(CF_ROOT))
 
 from utils.training_checkpoint import (  # noqa: E402
+    checkpoint_dir_for_step,
     extract_generator_state,
     load_checkpoint,
+    load_trainer_payload,
+    rolling_model_checkpoint_path,
     trainer_checkpoint_path,
 )
 
@@ -37,6 +40,29 @@ def test_auto_resumes_same_stage_and_restores_recorded_step(tmp_path: Path) -> N
     assert checkpoint.is_resume
     assert checkpoint.step == 2000
     assert trainer_checkpoint_path(model_path).name == "trainer.pt"
+
+
+def test_rolling_checkpoint_paths_use_last_directory(tmp_path: Path) -> None:
+    output_path = tmp_path / "action_stage1"
+
+    assert (
+        checkpoint_dir_for_step(output_path, 2000, checkpoint_dir_name="last")
+        == output_path / "last"
+    )
+    assert (
+        rolling_model_checkpoint_path(output_path, checkpoint_dir_name="last")
+        == output_path / "last" / "model.pt"
+    )
+
+
+def test_step_numbered_checkpoint_paths_can_still_be_requested(tmp_path: Path) -> None:
+    output_path = tmp_path / "action_stage1"
+
+    assert (
+        checkpoint_dir_for_step(output_path, 2000, checkpoint_dir_name="step")
+        == output_path / "checkpoint_model_002000"
+    )
+    assert rolling_model_checkpoint_path(output_path, checkpoint_dir_name="step") is None
 
 
 def test_auto_initializes_new_stage_and_prefers_ema(tmp_path: Path) -> None:
@@ -81,6 +107,35 @@ def test_legacy_checkpoint_infers_stage_and_step_from_path(tmp_path: Path) -> No
     assert checkpoint.is_resume
     assert checkpoint.checkpoint_stage == "action_node_stage2"
     assert checkpoint.step == 4500
+
+
+def test_mismatched_trainer_payload_is_ignored(tmp_path: Path) -> None:
+    model_path = tmp_path / "action_stage1" / "last" / "model.pt"
+    model_path.parent.mkdir(parents=True)
+    torch.save(
+        {
+            "training_stage": "action_stage1",
+            "step": 2000,
+            "generator": {"weight": torch.tensor([1.0])},
+        },
+        model_path,
+    )
+    torch.save(
+        {
+            "training_stage": "action_stage1",
+            "step": 1000,
+            "generator_optimizer": {"state": {}},
+        },
+        trainer_checkpoint_path(model_path),
+    )
+
+    checkpoint = load_checkpoint(
+        model_path,
+        current_stage="action_stage1",
+        checkpoint_mode="auto",
+    )
+
+    assert load_trainer_payload(checkpoint) is None
 
 
 def test_explicit_resume_rejects_previous_stage(tmp_path: Path) -> None:

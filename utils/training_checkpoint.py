@@ -11,6 +11,8 @@ import torch
 
 CHECKPOINT_FORMAT = "cf_ui_training_v1"
 CHECKPOINT_MODES = {"auto", "initialize", "resume"}
+DEFAULT_CHECKPOINT_DIR_NAME = "last"
+STEP_CHECKPOINT_DIR_NAMES = {"", "0", "false", "none", "step", "step_numbered"}
 KNOWN_STAGES = (
     "action_node_stage3_dmd",
     "action_node_ca_warmup",
@@ -46,6 +48,46 @@ def resolve_model_checkpoint_path(path: str | os.PathLike[str]) -> Path:
 
 def trainer_checkpoint_path(model_path: str | os.PathLike[str]) -> Path:
     return resolve_model_checkpoint_path(model_path).with_name("trainer.pt")
+
+
+def normalize_checkpoint_dir_name(
+    checkpoint_dir_name: str | os.PathLike[str] | None,
+) -> str | None:
+    if checkpoint_dir_name is None:
+        return None
+    name = str(checkpoint_dir_name).strip()
+    if name.lower() in STEP_CHECKPOINT_DIR_NAMES:
+        return None
+    name_path = Path(name)
+    if name in {".", ".."} or name_path.is_absolute() or name_path.name != name:
+        raise ValueError(
+            "checkpoint_dir_name must be a single directory name, "
+            f"got {checkpoint_dir_name!r}"
+        )
+    return name
+
+
+def checkpoint_dir_for_step(
+    output_path: str | os.PathLike[str],
+    step: int,
+    *,
+    checkpoint_dir_name: str | os.PathLike[str] | None = None,
+) -> Path:
+    checkpoint_dir_name = normalize_checkpoint_dir_name(checkpoint_dir_name)
+    if checkpoint_dir_name is not None:
+        return Path(output_path).expanduser() / checkpoint_dir_name
+    return Path(output_path).expanduser() / f"checkpoint_model_{int(step):06d}"
+
+
+def rolling_model_checkpoint_path(
+    output_path: str | os.PathLike[str],
+    *,
+    checkpoint_dir_name: str | os.PathLike[str] | None = DEFAULT_CHECKPOINT_DIR_NAME,
+) -> Path | None:
+    checkpoint_dir_name = normalize_checkpoint_dir_name(checkpoint_dir_name)
+    if checkpoint_dir_name is None:
+        return None
+    return Path(output_path).expanduser() / checkpoint_dir_name / "model.pt"
 
 
 def infer_checkpoint_stage(
@@ -128,6 +170,14 @@ def load_trainer_payload(checkpoint: CheckpointLoad) -> Mapping[str, Any] | None
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, Mapping):
         raise TypeError(f"Trainer checkpoint {path} must contain a mapping.")
+    trainer_step = infer_checkpoint_step(payload, path)
+    trainer_stage = infer_checkpoint_stage(payload, path)
+    if trainer_step != checkpoint.step or (
+        trainer_stage is not None
+        and checkpoint.checkpoint_stage is not None
+        and trainer_stage != checkpoint.checkpoint_stage
+    ):
+        return None
     return payload
 
 

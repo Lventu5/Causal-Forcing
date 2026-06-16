@@ -15,9 +15,12 @@ from utils.distributed import (
     load_fsdp_optim_state_dict,
 )
 from utils.misc import set_seed
+from utils.checkpoint_sync import CheckpointSyncManager
 from utils.training_checkpoint import (
     atomic_torch_save,
+    checkpoint_dir_for_step,
     checkpoint_metadata,
+    DEFAULT_CHECKPOINT_DIR_NAME,
     extract_generator_state,
     load_checkpoint,
     load_trainer_payload,
@@ -32,7 +35,6 @@ import torch.distributed as dist
 import torch
 import wandb
 import time
-from pathlib import Path
 from model import NaiveConsistency
 from utils.wandb_logging import init_wandb
 
@@ -270,6 +272,11 @@ class Trainer:
         self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_log_time = time.perf_counter()
+        self.checkpoint_sync = CheckpointSyncManager(
+            config,
+            output_path=self.output_path,
+            is_main_process=self.is_main_process,
+        )
         
         
 
@@ -298,14 +305,25 @@ class Trainer:
         trainer_state_dict["generator_optimizer"] = generator_optimizer_state_dict
 
         if self.is_main_process:
-            checkpoint_dir = (
-                Path(self.output_path) / f"checkpoint_model_{self.step:06d}"
+            checkpoint_dir = checkpoint_dir_for_step(
+                self.output_path,
+                self.step,
+                checkpoint_dir_name=getattr(
+                    self.config,
+                    "checkpoint_dir_name",
+                    DEFAULT_CHECKPOINT_DIR_NAME,
+                ),
             )
             model_path = checkpoint_dir / "model.pt"
             trainer_path = checkpoint_dir / "trainer.pt"
             atomic_torch_save(state_dict, model_path)
             atomic_torch_save(trainer_state_dict, trainer_path)
             print("Model saved to", model_path)
+            self.checkpoint_sync.sync(
+                checkpoint_dir,
+                step=self.step,
+                stage=self.training_stage,
+            )
 
             
     def fwdbwd_one_step(self, batch, clean_latent=None):
