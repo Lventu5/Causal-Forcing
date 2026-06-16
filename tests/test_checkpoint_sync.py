@@ -26,7 +26,6 @@ class DummyProcess:
 def _config(**overrides):
     values = {
         "checkpoint_sync_partitions": "",
-        "checkpoint_sync_current_partition": "",
         "checkpoint_sync_rsync_args": "-a --delete --partial",
         "checkpoint_sync_log_dir": "",
         "checkpoint_sync_mkpath": True,
@@ -68,11 +67,11 @@ def test_sync_launches_one_background_rsync_per_remote_partition(
         return DummyProcess()
 
     monkeypatch.setattr(checkpoint_sync.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "msp3-h200-[0-7]")
     checkpoint_dir = _checkpoint_dir(tmp_path)
     manager = CheckpointSyncManager(
         _config(
             checkpoint_sync_partitions="sof1,msp3,gcp-us",
-            checkpoint_sync_current_partition="msp3",
             checkpoint_sync_log_dir=str(tmp_path / "logs"),
         ),
         output_path=tmp_path / "action_stage1",
@@ -102,10 +101,11 @@ def test_sync_skips_when_previous_partition_sync_is_running(
         return DummyProcess(returncode=None)
 
     monkeypatch.setattr(checkpoint_sync.subprocess, "Popen", fake_popen)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "msp3-h200-[0-7]")
     checkpoint_dir = _checkpoint_dir(tmp_path)
     manager = CheckpointSyncManager(
         _config(
-            checkpoint_sync_partitions="sof1",
+            checkpoint_sync_partitions="sof1,msp3",
             checkpoint_sync_log_dir=str(tmp_path / "logs"),
         ),
         output_path=tmp_path / "action_stage1",
@@ -123,10 +123,11 @@ def test_sync_launch_failure_is_nonfatal(tmp_path: Path, monkeypatch) -> None:
         raise OSError("rsync unavailable")
 
     monkeypatch.setattr(checkpoint_sync.subprocess, "Popen", failing_popen)
+    monkeypatch.setenv("SLURM_JOB_NODELIST", "msp3-h200-[0-7]")
     checkpoint_dir = _checkpoint_dir(tmp_path)
     manager = CheckpointSyncManager(
         _config(
-            checkpoint_sync_partitions="sof1",
+            checkpoint_sync_partitions="sof1,msp3",
             checkpoint_sync_log_dir=str(tmp_path / "logs"),
         ),
         output_path=tmp_path / "action_stage1",
@@ -134,3 +135,29 @@ def test_sync_launch_failure_is_nonfatal(tmp_path: Path, monkeypatch) -> None:
     )
 
     manager.sync(checkpoint_dir, step=1, stage="action_stage1")
+
+
+def test_sync_skips_all_targets_when_current_partition_is_unknown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    launched = []
+
+    def fake_popen(command, **kwargs):
+        launched.append(command)
+        return DummyProcess()
+
+    monkeypatch.setattr(checkpoint_sync.subprocess, "Popen", fake_popen)
+    checkpoint_dir = _checkpoint_dir(tmp_path)
+    manager = CheckpointSyncManager(
+        _config(
+            checkpoint_sync_partitions="definitely-remote-a,definitely-remote-b",
+            checkpoint_sync_log_dir=str(tmp_path / "logs"),
+        ),
+        output_path=tmp_path / "action_stage1",
+        is_main_process=True,
+    )
+
+    manager.sync(checkpoint_dir, step=1, stage="action_stage1")
+
+    assert launched == []

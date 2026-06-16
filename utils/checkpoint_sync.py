@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -12,9 +13,6 @@ from typing import Any
 
 DEFAULT_RSYNC_ARGS = ("-a", "--delete", "--partial")
 CURRENT_PARTITION_ENV_KEYS = (
-    "CHECKPOINT_SYNC_CURRENT_PARTITION",
-    "CURRENT_PARTITION",
-    "PARTITION",
     "SLURM_CLUSTER_NAME",
     "SLURM_JOB_PARTITION",
     "SLURM_JOB_CONSTRAINTS",
@@ -59,18 +57,21 @@ def partition_matches(candidate: str, current: str | None) -> bool:
     )
 
 
-def detect_current_partition(
-    candidates: list[str],
-    explicit_current: str | None = None,
-) -> str | None:
-    if explicit_current:
-        return explicit_current.strip()
-
+def detect_current_partition(candidates: list[str]) -> str | None:
     env_values = [
         os.environ[key].strip()
         for key in CURRENT_PARTITION_ENV_KEYS
         if os.environ.get(key, "").strip()
     ]
+    env_values.extend(
+        value
+        for value in {
+            socket.gethostname(),
+            socket.getfqdn(),
+            getattr(os.uname(), "nodename", ""),
+        }
+        if value
+    )
     for candidate in candidates:
         if any(partition_matches(candidate, value) for value in env_values):
             return candidate
@@ -105,10 +106,7 @@ class CheckpointSyncManager:
         self.partitions = parse_partition_list(
             getattr(config, "checkpoint_sync_partitions", "")
         )
-        self.current_partition = detect_current_partition(
-            self.partitions,
-            str(getattr(config, "checkpoint_sync_current_partition", "") or ""),
-        )
+        self.current_partition = detect_current_partition(self.partitions)
         self.rsync_args = parse_rsync_args(
             getattr(config, "checkpoint_sync_rsync_args", None)
         )
@@ -181,13 +179,15 @@ class CheckpointSyncManager:
             return
 
         self._reap_finished()
-        if self.current_partition is None and not self._warned_unknown_current:
-            print(
-                "WARNING: checkpoint rsync current partition could not be inferred; "
-                "set checkpoint_sync_current_partition to skip the local partition.",
-                flush=True,
-            )
-            self._warned_unknown_current = True
+        if self.current_partition is None:
+            if not self._warned_unknown_current:
+                print(
+                    "WARNING: checkpoint rsync current partition could not be inferred; "
+                    "skipping cross-partition checkpoint sync.",
+                    flush=True,
+                )
+                self._warned_unknown_current = True
+            return
         checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
         if not checkpoint_dir.exists():
             print(
