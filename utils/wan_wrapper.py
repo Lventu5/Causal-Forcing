@@ -28,6 +28,45 @@ class FP32LayerNorm(nn.LayerNorm):
         ).to(dtype=x.dtype)
 
 
+class UIActionPositionEncoding(nn.Module):
+    """Fourier features over a smooth spherical encoding of normalized x/y."""
+
+    _R_MAX = math.sqrt(2.0)
+
+    def __init__(self, n_freqs: int = 8) -> None:
+        super().__init__()
+        self.n_freqs = int(n_freqs)
+        if self.n_freqs <= 0:
+            raise ValueError("action_fourier_freqs must be positive.")
+        freqs = torch.tensor(
+            [2 ** idx * math.pi for idx in range(self.n_freqs)],
+            dtype=torch.float32,
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    @property
+    def out_dim(self) -> int:
+        return 4 * 2 * self.n_freqs
+
+    def forward(self, xy: torch.Tensor) -> torch.Tensor:
+        x = xy[..., 0].clamp(0.0, 1.0)
+        y = xy[..., 1].clamp(0.0, 1.0)
+        radius = torch.sqrt(x * x + y * y).clamp(max=self._R_MAX)
+        theta = torch.atan2(y, x)
+        radius_angle = math.pi * radius / self._R_MAX
+        s3 = torch.stack(
+            [
+                torch.cos(theta),
+                torch.sin(theta),
+                torch.cos(radius_angle),
+                torch.sin(radius_angle),
+            ],
+            dim=-1,
+        ) / math.sqrt(2.0)
+        angles = s3.unsqueeze(-1) * self.freqs.to(device=xy.device, dtype=xy.dtype)
+        return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
+
+
 def _resolve_wan_model_dir(model_name: str, model_root: Optional[str] = None) -> Path:
     root = Path(model_root or os.environ.get("WAN_MODEL_DIR", "wan_models"))
     if root.name == model_name or (root / "Wan2.1_VAE.pth").exists():
@@ -43,6 +82,12 @@ class UIActionNodeConditioner(nn.Module):
         *,
         latent_channels: int = 16,
         action_dim: int = 3,
+        action_num_types: int = 6,
+        action_noop_type: int = 5,
+        action_type_emb_dim: int = 64,
+        action_fourier_freqs: int = 8,
+        action_spatial_hidden_dim: int = 32,
+        action_spatial_sigma: float = 0.035,
         node_token_dim: int = 1024,
         hidden_dim: int = 256,
         action_dropout: float = 0.0,
@@ -51,19 +96,43 @@ class UIActionNodeConditioner(nn.Module):
     ) -> None:
         super().__init__()
         self.action_dim = int(action_dim)
+        self.action_num_types = int(action_num_types)
+        self.action_noop_type = int(action_noop_type)
+        self.action_spatial_sigma = float(action_spatial_sigma)
         self.node_token_dim = int(node_token_dim)
         self.hidden_dim = int(hidden_dim)
         self.action_dropout = float(action_dropout)
         self.node_dropout = float(node_dropout)
         self.use_node_cross_attn = bool(use_node_cross_attn)
+        if self.action_dim < 3:
+            raise ValueError("UI action conditioning requires action_dim >= 3.")
+        if self.action_num_types <= 1:
+            raise ValueError("action_num_types must be greater than 1.")
+        if not 0 <= self.action_noop_type < self.action_num_types:
+            raise ValueError("action_noop_type must be in [0, action_num_types).")
+        if self.action_spatial_sigma <= 0.0:
+            raise ValueError("action_spatial_sigma must be positive.")
 
-        self.action_proj = nn.Sequential(
-            FP32LayerNorm(self.action_dim),
-            nn.Linear(self.action_dim, self.hidden_dim),
+        self.action_type_embedding = nn.Embedding(
+            self.action_num_types,
+            int(action_type_emb_dim),
+        )
+        self.action_position_encoding = UIActionPositionEncoding(
+            n_freqs=int(action_fourier_freqs),
+        )
+        action_feature_dim = int(action_type_emb_dim) + self.action_position_encoding.out_dim
+        self.action_global_proj = nn.Sequential(
+            FP32LayerNorm(action_feature_dim),
+            nn.Linear(action_feature_dim, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, latent_channels),
         )
-        self.action_gate = nn.Parameter(torch.full((1,), 1e-3))
+        self.action_spatial_proj = nn.Sequential(
+            nn.Conv2d(self.action_num_types + 1, int(action_spatial_hidden_dim), kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(int(action_spatial_hidden_dim), latent_channels, kernel_size=1),
+        )
+        self.action_residual_gate = nn.Parameter(torch.full((1,), 1e-2))
 
         self.q_proj = nn.Linear(latent_channels, self.hidden_dim)
         self.k_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
@@ -86,6 +155,82 @@ class UIActionNodeConditioner(nn.Module):
             keep = keep.unsqueeze(-1)
         return value * keep.to(dtype=value.dtype)
 
+    def _encode_action_condition(
+        self,
+        action_cond: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if action_cond.ndim != 3 or action_cond.shape[-1] < 3:
+            raise ValueError(
+                "action_cond must have shape [B, F, >=3], got "
+                f"{tuple(action_cond.shape)}."
+            )
+
+        device = action_cond.device
+        clean = torch.nan_to_num(
+            action_cond[..., :3].float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        raw_type = clean[..., 0]
+        xy = clean[..., 1:3].clamp(0.0, 1.0)
+        action_type = raw_type.round().long().clamp(0, self.action_num_types - 1)
+
+        null_row = clean.abs().amax(dim=-1) < 1e-8
+        noop_row = action_type == self.action_noop_type
+        valid = ~(null_row | noop_row)
+        valid_f = valid.to(dtype=dtype)
+
+        action_feature_dtype = self.action_global_proj[1].weight.dtype
+        action_feature = torch.cat(
+            [
+                self.action_type_embedding(action_type).to(dtype=action_feature_dtype),
+                self.action_position_encoding(xy.float()).to(dtype=action_feature_dtype),
+            ],
+            dim=-1,
+        )
+        global_residual = self.action_global_proj(action_feature).to(dtype=dtype)
+        global_residual = global_residual * valid_f[..., None]
+
+        grid_y = torch.linspace(0.0, 1.0, height, device=device, dtype=torch.float32)
+        grid_x = torch.linspace(0.0, 1.0, width, device=device, dtype=torch.float32)
+        yy, xx = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        dx = xx[None, None] - xy[..., 0, None, None]
+        dy = yy[None, None] - xy[..., 1, None, None]
+        sigma = float(self.action_spatial_sigma)
+        heatmap = torch.exp(-0.5 * ((dx / sigma) ** 2 + (dy / sigma) ** 2))
+        heatmap = heatmap * valid_f[..., None, None].float()
+
+        type_maps = F.one_hot(
+            action_type,
+            num_classes=self.action_num_types,
+        ).to(dtype=torch.float32)
+        type_maps = type_maps[..., :, None, None] * heatmap.unsqueeze(-3)
+        spatial_input = torch.cat([heatmap.unsqueeze(-3), type_maps], dim=-3)
+        bsz, frames = spatial_input.shape[:2]
+        spatial_residual = self.action_spatial_proj(
+            spatial_input.reshape(
+                bsz * frames,
+                self.action_num_types + 1,
+                height,
+                width,
+            ).to(dtype=self.action_spatial_proj[0].weight.dtype)
+        )
+        spatial_residual = spatial_residual.reshape(
+            bsz,
+            frames,
+            spatial_residual.shape[1],
+            height,
+            width,
+        ).to(dtype=dtype)
+        spatial_residual = spatial_residual * valid_f[:, :, None, None, None]
+
+        return spatial_residual + global_residual[..., None, None]
+
     def forward(
         self,
         latents: torch.Tensor,
@@ -99,13 +244,23 @@ class UIActionNodeConditioner(nn.Module):
         dtype = latents.dtype
 
         if action_cond is not None:
-            action_dtype = self.action_proj[1].weight.dtype
+            if action_cond.shape[:2] != latents.shape[:2]:
+                raise ValueError(
+                    "action_cond frame shape must match latents: "
+                    f"got {tuple(action_cond.shape[:2])}, expected {tuple(latents.shape[:2])}."
+                )
+            action_dtype = self.action_type_embedding.weight.dtype
             action_cond = self._drop_frame_condition(
                 action_cond.to(device=latents.device, dtype=action_dtype),
                 self.action_dropout,
             )
-            action_bias = self.action_proj(action_cond).to(dtype=dtype)
-            out = out + torch.tanh(self.action_gate).to(dtype=dtype) * action_bias[..., None, None]
+            action_residual = self._encode_action_condition(
+                action_cond,
+                height=latents.shape[-2],
+                width=latents.shape[-1],
+                dtype=dtype,
+            )
+            out = out + torch.tanh(self.action_residual_gate).to(dtype=dtype) * action_residual
 
         if self.use_node_cross_attn and node_tokens is not None:
             bsz, frames, channels, height, width = out.shape
@@ -321,6 +476,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.ui_conditioner = UIActionNodeConditioner(
                 latent_channels=int(ui_conditioning.get("latent_channels", 16)),
                 action_dim=int(ui_conditioning.get("action_dim", 3)),
+                action_num_types=int(ui_conditioning.get("action_num_types", 6)),
+                action_noop_type=int(ui_conditioning.get("action_noop_type", 5)),
+                action_type_emb_dim=int(ui_conditioning.get("action_type_emb_dim", 64)),
+                action_fourier_freqs=int(ui_conditioning.get("action_fourier_freqs", 8)),
+                action_spatial_hidden_dim=int(ui_conditioning.get("action_spatial_hidden_dim", 32)),
+                action_spatial_sigma=float(ui_conditioning.get("action_spatial_sigma", 0.035)),
                 node_token_dim=node_token_dim,
                 hidden_dim=int(ui_conditioning.get("hidden_dim", 256)),
                 action_dropout=float(ui_conditioning.get("action_dropout", 0.0)),

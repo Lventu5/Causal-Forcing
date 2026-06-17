@@ -23,7 +23,8 @@ from utils.ui_sim_element_loss import (  # noqa: E402
     build_element_loss_weight_map,
 )
 from utils.ui_sim_visualization import UISimTrainingVisualizer  # noqa: E402
-from utils.wan_wrapper import UIActionNodeConditioner, WanVAEWrapper  # noqa: E402
+from utils.wan_wrapper import UIActionNodeConditioner, WanDiffusionWrapper, WanVAEWrapper  # noqa: E402
+from pipeline import CausalDiffusionInferencePipeline  # noqa: E402
 from wan.modules.causal_model import CausalWanModel  # noqa: E402
 from wan.modules.model import WanCrossAttention  # noqa: E402
 
@@ -90,7 +91,7 @@ def test_attach_ui_batch_conditioning_shifts_i2v_source_rows() -> None:
     )
 
     assert cond["action_cond"].shape == (1, 4, 3)
-    assert torch.equal(cond["action_cond"][0, 0], torch.zeros(3))
+    assert torch.equal(cond["action_cond"][0, 0], torch.tensor([5.0, 0.0, 0.0]))
     assert torch.equal(cond["action_cond"][0, 1], batch["actions"][0, 0])
     assert cond["node_tokens"].shape == (1, 4, 2, 4)
     assert cond["node_mask"][0, 0].tolist() == [False, False]
@@ -469,8 +470,9 @@ def test_action_conditioner_freezes_unused_node_adapter_for_block_attention() ->
 
     conditioner.enable_trainable_parameters()
 
-    assert conditioner.action_gate.requires_grad
-    assert conditioner.action_proj[1].weight.requires_grad
+    assert conditioner.action_residual_gate.requires_grad
+    assert conditioner.action_type_embedding.weight.requires_grad
+    assert conditioner.action_spatial_proj[0].weight.requires_grad
     assert not conditioner.q_proj.weight.requires_grad
     assert not conditioner.k_proj.weight.requires_grad
     assert not conditioner.v_proj.weight.requires_grad
@@ -487,3 +489,115 @@ def test_action_conditioner_ignores_nodes_when_disabled() -> None:
     output = conditioner(latents, node_tokens=node_tokens, node_mask=node_mask)
 
     assert torch.equal(output, latents)
+
+
+def test_action_conditioner_uses_spatial_action_maps() -> None:
+    conditioner = UIActionNodeConditioner(use_node_cross_attn=False)
+    latents = torch.zeros(1, 2, 16, 8, 8)
+    actions = torch.tensor(
+        [
+            [
+                [5.0, 0.0, 0.0],
+                [1.0, 0.5, 0.5],
+            ]
+        ]
+    )
+
+    output = conditioner(latents, action_cond=actions)
+
+    assert output.shape == latents.shape
+    assert torch.isfinite(output).all()
+    assert torch.equal(output[:, :1], latents[:, :1])
+    assert not torch.equal(output[:, 1:], latents[:, 1:])
+
+
+def test_action_conditioner_dropout_zeroes_action_signal() -> None:
+    conditioner = UIActionNodeConditioner(
+        use_node_cross_attn=False,
+        action_dropout=1.0,
+    )
+    conditioner.train()
+    latents = torch.zeros(1, 1, 16, 4, 4)
+    actions = torch.tensor([[[1.0, 0.5, 0.5]]])
+
+    output = conditioner(latents, action_cond=actions)
+
+    assert torch.equal(output, latents)
+
+
+def test_action_conditioner_rejects_misaligned_action_frames() -> None:
+    conditioner = UIActionNodeConditioner(use_node_cross_attn=False)
+    latents = torch.zeros(1, 2, 16, 4, 4)
+    actions = torch.zeros(1, 1, 3)
+
+    try:
+        conditioner(latents, action_cond=actions)
+    except ValueError as exc:
+        assert "action_cond frame shape" in str(exc)
+    else:
+        raise AssertionError("Expected misaligned action frames to fail.")
+
+
+def test_action_conditioner_partial_load_ignores_old_action_mlp_keys() -> None:
+    conditioner = UIActionNodeConditioner(use_node_cross_attn=False)
+    old_state = {
+        "action_gate": torch.ones(1),
+        "action_proj.1.weight": torch.randn(256, 3),
+        "action_proj.1.bias": torch.randn(256),
+        "action_proj.3.weight": torch.randn(16, 256),
+        "action_proj.3.bias": torch.randn(16),
+    }
+
+    result = conditioner.load_state_dict(old_state, strict=False)
+
+    assert "action_gate" in result.unexpected_keys
+    assert "action_proj.1.weight" in result.unexpected_keys
+    assert "action_residual_gate" in result.missing_keys
+
+
+def test_pipeline_marks_ui_conditions_with_local_frame_start() -> None:
+    condition = {
+        "prompt_embeds": torch.ones(1, 2, 8),
+        "action_cond": torch.randn(1, 16, 3),
+    }
+
+    shifted = CausalDiffusionInferencePipeline._condition_dict_for_local_frame(
+        condition,
+        7,
+    )
+
+    assert shifted["ui_frame_start"] == 7
+    assert "ui_frame_start" not in condition
+    assert shifted["action_cond"] is condition["action_cond"]
+
+
+def test_wan_wrapper_ui_frame_start_overrides_global_token_start() -> None:
+    class Recorder:
+        def __init__(self) -> None:
+            self.action_cond = None
+
+        def __call__(self, latents: torch.Tensor, **kwargs) -> torch.Tensor:
+            self.action_cond = kwargs["action_cond"].detach().clone()
+            return latents
+
+    wrapper = WanDiffusionWrapper.__new__(WanDiffusionWrapper)
+    recorder = Recorder()
+    wrapper.ui_conditioner = recorder
+    wrapper.block_cross_attn_enabled = False
+    wrapper.node_conditioning_enabled = False
+    wrapper.frame_seq_length = 2
+
+    latents = torch.zeros(1, 1, 16, 1, 1)
+    actions = torch.arange(5 * 3, dtype=torch.float32).reshape(1, 5, 3)
+
+    wrapper._prepare_ui_conditioning(
+        latents,
+        {
+            "action_cond": actions,
+            "ui_frame_start": 2,
+        },
+        current_start=99 * wrapper.frame_seq_length,
+    )
+
+    assert recorder.action_cond is not None
+    assert torch.equal(recorder.action_cond, actions[:, 2:3])

@@ -243,6 +243,10 @@ def attach_ui_batch_conditioning(
             num_latent_frames=num_latent_frames,
             i2v=i2v,
         )
+        if i2v and actions.shape[1] > 0 and actions.shape[-1] >= 3:
+            actions = actions.clone()
+            actions[:, 0, 0] = 5.0
+            actions[:, 0, 1:3] = 0.0
         actions, _ = _apply_frame_condition_dropout(
             actions,
             p=action_dropout,
