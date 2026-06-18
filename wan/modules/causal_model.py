@@ -279,6 +279,7 @@ class CausalWanAttentionBlock(nn.Module):
                                                                       qk_norm,
                                                                       eps)
         self.condition_cross_attn = None
+        self.action_condition_cross_attn = None
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -303,6 +304,10 @@ class CausalWanAttentionBlock(nn.Module):
         cache_start=None,
         condition_tokens=None,
         condition_mask=None,
+        condition_positions=None,
+        action_tokens=None,
+        action_mask=None,
+        action_positions=None,
     ):
         r"""
         Args:
@@ -336,8 +341,20 @@ class CausalWanAttentionBlock(nn.Module):
                     self.norm3(x),
                     condition_tokens,
                     condition_mask,
+                    condition_positions,
                     num_frames=num_frames,
                     frame_seqlen=frame_seqlen,
+                    grid_sizes=grid_sizes,
+                )
+            if self.action_condition_cross_attn is not None and action_tokens is not None:
+                x = x + self.action_condition_cross_attn(
+                    self.norm3(x),
+                    action_tokens,
+                    action_mask,
+                    action_positions,
+                    num_frames=num_frames,
+                    frame_seqlen=frame_seqlen,
+                    grid_sizes=grid_sizes,
                 )
             y = self.ffn(
                 (self.norm2(x).unflatten(dim=1, sizes=(num_frames,
@@ -809,6 +826,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         cache_start: int = 0,
         condition_tokens=None,
         condition_mask=None,
+        condition_positions=None,
+        action_tokens=None,
+        action_mask=None,
+        action_positions=None,
     ):
         r"""
         Run the diffusion model with kv caching.
@@ -892,6 +913,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask,
             condition_tokens=condition_tokens,
             condition_mask=condition_mask,
+            condition_positions=condition_positions,
+            action_tokens=action_tokens,
+            action_mask=action_mask,
+            action_positions=action_positions,
         )
 
         def create_custom_forward(module):
@@ -942,6 +967,10 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         y=None,
         condition_tokens=None,
         condition_mask=None,
+        condition_positions=None,
+        action_tokens=None,
+        action_mask=None,
+        action_positions=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -1053,7 +1082,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context_lens=context_lens,
             block_mask=self.block_mask,
             condition_tokens=condition_tokens,
-            condition_mask=condition_mask)
+            condition_mask=condition_mask,
+            condition_positions=condition_positions,
+            action_tokens=action_tokens,
+            action_mask=action_mask,
+            action_positions=action_positions)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -1084,6 +1117,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self,
         condition_dim=1024,
         dropout=0.0,
+        position_encoding="learned_projection",
     ):
         for block in self.blocks:
             block.condition_cross_attn = WanCrossAttention(
@@ -1093,12 +1127,35 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 qk_norm=self.qk_norm,
                 eps=self.eps,
                 dropout=dropout,
+                position_encoding=position_encoding,
+            )
+
+    def add_action_condition_cross_attention(
+        self,
+        condition_dim=1024,
+        dropout=0.0,
+        position_encoding="learned_projection",
+    ):
+        for block in self.blocks:
+            block.action_condition_cross_attn = WanCrossAttention(
+                self.dim,
+                self.num_heads,
+                condition_dim=condition_dim,
+                qk_norm=self.qk_norm,
+                eps=self.eps,
+                dropout=dropout,
+                position_encoding=position_encoding,
             )
 
     def set_condition_cross_attention_requires_grad(self, requires_grad=True):
         for block in self.blocks:
             if block.condition_cross_attn is not None:
                 block.condition_cross_attn.requires_grad_(requires_grad)
+
+    def set_action_condition_cross_attention_requires_grad(self, requires_grad=True):
+        for block in self.blocks:
+            if block.action_condition_cross_attn is not None:
+                block.action_condition_cross_attn.requires_grad_(requires_grad)
 
     def forward(
         self,

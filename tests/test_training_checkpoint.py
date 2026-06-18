@@ -116,6 +116,21 @@ def test_actionmap_stage_initializes_from_old_action_stage1(tmp_path: Path) -> N
     assert checkpoint.step == 25000
 
 
+def test_legacy_actionxattn_checkpoint_infers_stage_from_path(tmp_path: Path) -> None:
+    model_path = tmp_path / "action_stage1_actionxattn" / "last" / "model.pt"
+    model_path.parent.mkdir(parents=True)
+    torch.save({"generator": {"weight": torch.tensor([1.0])}}, model_path)
+
+    checkpoint = load_checkpoint(
+        model_path,
+        current_stage="action_stage1_actionxattn",
+        checkpoint_mode="auto",
+    )
+
+    assert checkpoint.is_resume
+    assert checkpoint.checkpoint_stage == "action_stage1_actionxattn"
+
+
 def test_legacy_checkpoint_infers_stage_and_step_from_path(tmp_path: Path) -> None:
     model_path = tmp_path / "action_node_stage2" / "checkpoint_model_004500" / "model.pt"
     model_path.parent.mkdir(parents=True)

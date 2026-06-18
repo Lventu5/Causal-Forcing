@@ -58,6 +58,8 @@ model_kwargs:
     latent_channels: 16
     hidden_dim: 256
     block_cross_attn: true
+    require_graph_token_positions: true
+    condition_position_encoding: ${oc.env:UI_CONDITION_POSITION_ENCODING,learned_projection}
     freeze_backbone: true
     condition_cross_attn_only: true
     action_dropout: 0.0

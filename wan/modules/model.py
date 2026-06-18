@@ -292,6 +292,9 @@ class WanCrossAttention(nn.Module):
         qk_norm=True,
         eps=1e-6,
         dropout=0.0,
+        position_encoding="learned_projection",
+        position_rope_scale=2.0 * math.pi,
+        position_rope_theta=10000.0,
     ):
         assert dim % num_heads == 0
         super().__init__()
@@ -300,11 +303,23 @@ class WanCrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.condition_dim = dim if condition_dim is None else int(condition_dim)
         self.dropout = float(dropout)
+        self.position_encoding = str(position_encoding)
+        if self.position_encoding not in {"learned_projection", "rope_2d"}:
+            raise ValueError(
+                "position_encoding must be 'learned_projection' or 'rope_2d', "
+                f"got {position_encoding!r}."
+            )
+        if self.position_encoding == "rope_2d" and self.head_dim < 4:
+            raise ValueError("rope_2d condition position encoding requires head_dim >= 4.")
+        self.position_rope_scale = float(position_rope_scale)
+        self.position_rope_theta = float(position_rope_theta)
 
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(self.condition_dim, dim)
         self.v = nn.Linear(self.condition_dim, dim)
         self.o = nn.Linear(dim, dim)
+        self.query_pos = nn.Linear(2, dim, bias=False)
+        self.condition_pos = nn.Linear(2, dim, bias=False)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.gate = nn.Parameter(torch.full((1,), 1e-3))
@@ -313,6 +328,8 @@ class WanCrossAttention(nn.Module):
         nn.init.xavier_uniform_(self.k.weight)
         nn.init.xavier_uniform_(self.v.weight)
         nn.init.xavier_uniform_(self.o.weight)
+        nn.init.xavier_uniform_(self.query_pos.weight)
+        nn.init.xavier_uniform_(self.condition_pos.weight)
         for layer in (self.q, self.k, self.v, self.o):
             if layer.bias is not None:
                 nn.init.zeros_(layer.bias)
@@ -336,14 +353,97 @@ class WanCrossAttention(nn.Module):
             f"Condition has {value.shape[1]} frames, cannot align to {num_frames} frames."
         )
 
+    @staticmethod
+    def _frame_query_positions(
+        *,
+        bsz,
+        num_frames,
+        frame_seqlen,
+        grid_sizes,
+        device,
+        dtype,
+    ):
+        if grid_sizes is None:
+            return None
+        positions = []
+        for _, height, width in grid_sizes.tolist():
+            height = int(height)
+            width = int(width)
+            if height * width != int(frame_seqlen):
+                return None
+            y = (torch.arange(height, device=device, dtype=dtype) + 0.5) / float(height)
+            x = (torch.arange(width, device=device, dtype=dtype) + 0.5) / float(width)
+            yy, xx = torch.meshgrid(y, x, indexing="ij")
+            frame_pos = torch.stack([xx, yy], dim=-1).reshape(1, frame_seqlen, 2)
+            positions.append(frame_pos.expand(num_frames, -1, -1))
+        if len(positions) != int(bsz):
+            return None
+        return torch.cat(positions, dim=0)
+
+    @staticmethod
+    def _apply_axis_rope(part, coord, inv_freq, scale):
+        part_dtype = part.dtype
+        angles = (
+            coord.float().unsqueeze(1).unsqueeze(-1)
+            * float(scale)
+            * inv_freq.to(device=part.device).float().view(1, 1, 1, -1)
+        )
+        even = part.float()[..., 0::2]
+        odd = part.float()[..., 1::2]
+        cos = angles.cos()
+        sin = angles.sin()
+        rotated = torch.stack(
+            [even * cos - odd * sin, even * sin + odd * cos],
+            dim=-1,
+        ).flatten(-2)
+        return rotated.to(dtype=part_dtype)
+
+    def _rope_axis_dims(self):
+        x_dim = (self.head_dim // 2) // 2 * 2
+        y_dim = ((self.head_dim - x_dim) // 2) * 2
+        if x_dim <= 0 or y_dim <= 0:
+            raise ValueError(
+                f"rope_2d requires at least one rotary pair per axis, got head_dim={self.head_dim}."
+            )
+        return x_dim, y_dim
+
+    def _rope_inv_freq(self, axis_dim, *, device):
+        return 1.0 / (
+            self.position_rope_theta
+            ** (torch.arange(0, axis_dim, 2, device=device, dtype=torch.float32) / float(axis_dim))
+        )
+
+    def _apply_2d_rope(self, value, positions):
+        x_dim, y_dim = self._rope_axis_dims()
+        x_part = value[..., :x_dim]
+        y_part = value[..., x_dim:x_dim + y_dim]
+        rest = value[..., x_dim + y_dim:]
+        x_part = self._apply_axis_rope(
+            x_part,
+            positions[..., 0],
+            self._rope_inv_freq(x_dim, device=value.device),
+            self.position_rope_scale,
+        )
+        y_part = self._apply_axis_rope(
+            y_part,
+            positions[..., 1],
+            self._rope_inv_freq(y_dim, device=value.device),
+            self.position_rope_scale,
+        )
+        if rest.numel() == 0:
+            return torch.cat([x_part, y_part], dim=-1)
+        return torch.cat([x_part, y_part, rest], dim=-1)
+
     def forward(
         self,
         x,
         condition_tokens,
         condition_mask=None,
+        condition_positions=None,
         *,
         num_frames=None,
         frame_seqlen=None,
+        grid_sizes=None,
     ):
         r"""
         Args:
@@ -389,24 +489,70 @@ class WanCrossAttention(nn.Module):
                 fill_value=False,
                 unframed_ndim=2,
             )
+        positions = None
+        if condition_positions is not None:
+            positions = condition_positions.to(device=x.device, dtype=dtype)
+            positions = self._align_frames(positions, num_frames)
 
         flat_tokens = tokens.reshape(bsz * num_frames, tokens.shape[-2], tokens.shape[-1])
         flat_mask = mask.reshape(bsz * num_frames, mask.shape[-1])
-        empty = ~flat_mask.any(dim=-1)
+        flat_positions = None
+        if positions is not None:
+            if positions.shape[:3] != tokens.shape[:3] or positions.shape[-1] != 2:
+                raise ValueError(
+                    "condition_positions must have shape [B, F, K, 2] aligned "
+                    f"with condition tokens, got {tuple(positions.shape)} for "
+                    f"tokens {tuple(tokens.shape)}."
+                )
+            flat_positions = positions.reshape(bsz * num_frames, positions.shape[-2], positions.shape[-1])
+        frame_has_condition = flat_mask.any(dim=-1)
+        empty = ~frame_has_condition
         if empty.any():
             flat_mask = flat_mask.clone()
             flat_mask[empty, 0] = True
             flat_tokens = flat_tokens.clone()
             flat_tokens[empty] = 0
+            if flat_positions is not None:
+                flat_positions = flat_positions.clone()
+                flat_positions[empty] = 0.5
 
         x_active = x[:, :active_len]
         query_tokens = x_active.reshape(bsz * num_frames, frame_seqlen, channels)
-        q = self.norm_q(self.q(query_tokens)).view(
+        q_linear = self.q(query_tokens)
+        k_linear = self.k(flat_tokens)
+        query_positions = None
+        if flat_positions is not None:
+            query_positions = self._frame_query_positions(
+                bsz=bsz,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                grid_sizes=grid_sizes,
+                device=x.device,
+                dtype=dtype,
+            )
+            if self.position_encoding == "learned_projection":
+                if query_positions is not None:
+                    q_pos = self.query_pos(
+                        query_positions.to(dtype=self.query_pos.weight.dtype)
+                    ).to(dtype=q_linear.dtype)
+                    q_linear = q_linear + q_pos
+                k_pos = self.condition_pos(
+                    flat_positions.to(dtype=self.condition_pos.weight.dtype)
+                ).to(dtype=k_linear.dtype)
+                k_linear = k_linear + k_pos
+            elif query_positions is None:
+                raise ValueError("rope_2d condition position encoding requires grid_sizes.")
+        q = self.norm_q(q_linear).view(
             bsz * num_frames, frame_seqlen, self.num_heads, self.head_dim
         ).transpose(1, 2)
-        k = self.norm_k(self.k(flat_tokens)).view(
+        k = self.norm_k(k_linear).view(
             bsz * num_frames, flat_tokens.shape[1], self.num_heads, self.head_dim
         ).transpose(1, 2)
+        if flat_positions is not None and self.position_encoding == "rope_2d":
+            if query_positions is None:
+                raise ValueError("rope_2d condition position encoding requires grid_sizes.")
+            q = self._apply_2d_rope(q, query_positions)
+            k = self._apply_2d_rope(k, flat_positions)
         v = self.v(flat_tokens).view(
             bsz * num_frames, flat_tokens.shape[1], self.num_heads, self.head_dim
         ).transpose(1, 2)
@@ -422,7 +568,9 @@ class WanCrossAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
         )
         attended = attended.transpose(1, 2).flatten(2)
-        residual = self.o(attended).reshape(bsz, active_len, channels)
+        residual = self.o(attended)
+        residual = residual * frame_has_condition[:, None, None].to(dtype=residual.dtype)
+        residual = residual.reshape(bsz, active_len, channels)
 
         out = x.new_zeros(x.shape)
         out[:, :active_len] = torch.tanh(self.gate).to(dtype=dtype) * residual.to(dtype=dtype)
@@ -462,6 +610,7 @@ class WanAttentionBlock(nn.Module):
                                                                       qk_norm,
                                                                       eps)
         self.condition_cross_attn = None
+        self.action_condition_cross_attn = None
         self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim), nn.GELU(approximate='tanh'),
@@ -481,6 +630,10 @@ class WanAttentionBlock(nn.Module):
         context_lens,
         condition_tokens=None,
         condition_mask=None,
+        condition_positions=None,
+        action_tokens=None,
+        action_mask=None,
+        action_positions=None,
     ):
         r"""
         Args:
@@ -505,6 +658,18 @@ class WanAttentionBlock(nn.Module):
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
+            if self.action_condition_cross_attn is not None and action_tokens is not None:
+                num_frames = int(action_tokens.shape[1]) if action_tokens.ndim == 4 else 1
+                frame_seqlen = x.shape[1] // num_frames
+                x = x + self.action_condition_cross_attn(
+                    self.norm3(x),
+                    action_tokens,
+                    action_mask,
+                    action_positions,
+                    num_frames=num_frames,
+                    frame_seqlen=frame_seqlen,
+                    grid_sizes=grid_sizes,
+                )
             if self.condition_cross_attn is not None and condition_tokens is not None:
                 num_frames = int(condition_tokens.shape[1]) if condition_tokens.ndim == 4 else 1
                 frame_seqlen = x.shape[1] // num_frames
@@ -512,8 +677,10 @@ class WanAttentionBlock(nn.Module):
                     self.norm3(x),
                     condition_tokens,
                     condition_mask,
+                    condition_positions,
                     num_frames=num_frames,
                     frame_seqlen=frame_seqlen,
+                    grid_sizes=grid_sizes,
                 )
             y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
             # with amp.autocast(dtype=torch.float32):
@@ -825,6 +992,10 @@ class WanModel(ModelMixin, ConfigMixin):
         y=None,
         condition_tokens=None,
         condition_mask=None,
+        condition_positions=None,
+        action_tokens=None,
+        action_mask=None,
+        action_positions=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -898,7 +1069,11 @@ class WanModel(ModelMixin, ConfigMixin):
             context=context,
             context_lens=context_lens,
             condition_tokens=condition_tokens,
-            condition_mask=condition_mask)
+            condition_mask=condition_mask,
+            condition_positions=condition_positions,
+            action_tokens=action_tokens,
+            action_mask=action_mask,
+            action_positions=action_positions)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):
@@ -954,6 +1129,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self,
         condition_dim=1024,
         dropout=0.0,
+        position_encoding="learned_projection",
     ):
         for block in self.blocks:
             block.condition_cross_attn = WanCrossAttention(
@@ -963,12 +1139,35 @@ class WanModel(ModelMixin, ConfigMixin):
                 qk_norm=self.qk_norm,
                 eps=self.eps,
                 dropout=dropout,
+                position_encoding=position_encoding,
+            )
+
+    def add_action_condition_cross_attention(
+        self,
+        condition_dim=1024,
+        dropout=0.0,
+        position_encoding="learned_projection",
+    ):
+        for block in self.blocks:
+            block.action_condition_cross_attn = WanCrossAttention(
+                self.dim,
+                self.num_heads,
+                condition_dim=condition_dim,
+                qk_norm=self.qk_norm,
+                eps=self.eps,
+                dropout=dropout,
+                position_encoding=position_encoding,
             )
 
     def set_condition_cross_attention_requires_grad(self, requires_grad=True):
         for block in self.blocks:
             if block.condition_cross_attn is not None:
                 block.condition_cross_attn.requires_grad_(requires_grad)
+
+    def set_action_condition_cross_attention_requires_grad(self, requires_grad=True):
+        for block in self.blocks:
+            if block.action_condition_cross_attn is not None:
+                block.action_condition_cross_attn.requires_grad_(requires_grad)
 
     def _forward_classify(
         self,

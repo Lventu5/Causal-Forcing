@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import re
 from typing import Any, Mapping, MutableMapping, Optional, Tuple
 
 import torch
+
+
+_GRAPH_TOKEN_BBOX_RE = re.compile(r"@(\d+),(\d+),(\d+),(\d+)(?:\s|$)")
 
 
 @dataclass(frozen=True)
@@ -129,6 +135,55 @@ def unpack_packed_graph_tokens(
         mask = mask.clone()
         mask[..., 0] |= empty
     return tokens, mask
+
+
+def graph_token_sidecar_path(node_emb_path: str | Path) -> Path:
+    """Return the sibling ``*_node_tokens.json`` path for a node embedding sidecar."""
+    path = Path(node_emb_path)
+    if path.name.endswith("_node_emb.pt"):
+        return path.with_name(path.name.replace("_node_emb.pt", "_node_tokens.json"))
+    return path.with_name(f"{path.stem}_node_tokens.json")
+
+
+def _parse_graph_token_bbox_center(text: str) -> tuple[float, float]:
+    match = _GRAPH_TOKEN_BBOX_RE.search(text)
+    if match is None:
+        return 0.5, 0.5
+    x1, y1, x2, y2 = (max(0.0, min(1.0, float(value) / 100.0)) for value in match.groups())
+    return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+
+def load_graph_token_positions(
+    token_sidecar_path: str | Path,
+    *,
+    start: int,
+    num_frames: int,
+    tokens_per_frame: int,
+) -> torch.Tensor:
+    """Load per-token normalized bbox-center positions from ``*_node_tokens.json``."""
+    path = Path(token_sidecar_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    frames = payload.get("frames")
+    if not isinstance(frames, list):
+        raise ValueError(f"Graph-token sidecar must contain a frames list: {path}")
+
+    needed = max(int(num_frames) - 1, 0)
+    if len(frames) < int(start) + needed:
+        raise ValueError(
+            f"Graph-token sidecar too short for clip start={start}, frames={num_frames}: "
+            f"got {len(frames)}, need {int(start) + needed} ({path})."
+        )
+
+    positions = torch.zeros(needed, int(tokens_per_frame), 2, dtype=torch.float32)
+    for frame_offset, raw_tokens in enumerate(frames[int(start): int(start) + needed]):
+        if not isinstance(raw_tokens, list):
+            raw_tokens = []
+        for slot, text in enumerate(raw_tokens[: int(tokens_per_frame)]):
+            positions[frame_offset, slot] = torch.tensor(
+                _parse_graph_token_bbox_center(str(text)),
+                dtype=torch.float32,
+            )
+    return positions
 
 
 def prepend_null_frame(tensor: torch.Tensor, *, dim: int = 1) -> torch.Tensor:
@@ -293,5 +348,19 @@ def attach_ui_batch_conditioning(
         cond["node_mask"] = node_mask
         uncond["node_tokens"] = torch.zeros_like(node_tokens)
         uncond["node_mask"] = torch.zeros_like(node_mask)
+
+        if "node_positions" in batch:
+            node_positions = torch.as_tensor(batch["node_positions"]).to(
+                device=device,
+                dtype=dtype,
+                non_blocking=True,
+            )
+            node_positions = align_source_rows_to_latent_frames(
+                node_positions,
+                num_latent_frames=num_latent_frames,
+                i2v=i2v,
+            )
+            cond["node_positions"] = node_positions
+            uncond["node_positions"] = torch.zeros_like(node_positions)
 
     return cond, uncond

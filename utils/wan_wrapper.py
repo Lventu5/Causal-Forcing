@@ -2,7 +2,7 @@ import math
 import os
 import types
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -67,6 +67,87 @@ class UIActionPositionEncoding(nn.Module):
         return torch.cat([angles.sin(), angles.cos()], dim=-1).flatten(-2)
 
 
+class UICenteredPolarPositionEncoding(nn.Module):
+    """Angle plus Fourier radius features around the screen center."""
+
+    def __init__(
+        self,
+        n_freqs: int = 8,
+        *,
+        target_width: int = 832,
+        target_height: int = 480,
+    ) -> None:
+        super().__init__()
+        self.n_freqs = int(n_freqs)
+        if self.n_freqs <= 0:
+            raise ValueError("action_fourier_freqs must be positive.")
+        self.target_width = float(target_width)
+        self.target_height = float(target_height)
+        corner_dx = self.target_width * 0.5
+        corner_dy = self.target_height * 0.5
+        self.radius_max = math.sqrt(corner_dx * corner_dx + corner_dy * corner_dy)
+        freqs = torch.tensor(
+            [2 ** idx * math.pi for idx in range(self.n_freqs)],
+            dtype=torch.float32,
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    @property
+    def out_dim(self) -> int:
+        return 1 + 2 * self.n_freqs
+
+    def forward(self, xy: torch.Tensor) -> torch.Tensor:
+        x = xy[..., 0].clamp(0.0, 1.0)
+        y = xy[..., 1].clamp(0.0, 1.0)
+        dx = (x - 0.5) * self.target_width
+        dy = (y - 0.5) * self.target_height
+        angle = torch.atan2(dy, dx) / math.pi
+        radius = torch.sqrt(dx * dx + dy * dy) / max(self.radius_max, 1e-6)
+        radius = radius.clamp(0.0, 1.0)
+        radius_angles = radius.unsqueeze(-1) * self.freqs.to(device=xy.device, dtype=xy.dtype)
+        radius_features = torch.cat([radius_angles.sin(), radius_angles.cos()], dim=-1)
+        return torch.cat([angle.unsqueeze(-1), radius_features], dim=-1)
+
+
+class UIPatchDiscretePositionEncoding(nn.Module):
+    """Learned x/y embeddings after mapping normalized coordinates to WAN patches."""
+
+    def __init__(
+        self,
+        *,
+        grid_height: int = 30,
+        grid_width: int = 52,
+        emb_dim: int = 64,
+    ) -> None:
+        super().__init__()
+        self.grid_height = int(grid_height)
+        self.grid_width = int(grid_width)
+        self.emb_dim = int(emb_dim)
+        if self.grid_height <= 0 or self.grid_width <= 0:
+            raise ValueError("patch discrete grid dimensions must be positive.")
+        if self.emb_dim <= 1:
+            raise ValueError("patch discrete embedding dim must be greater than 1.")
+        x_dim = self.emb_dim // 2
+        y_dim = self.emb_dim - x_dim
+        self.x_embedding = nn.Embedding(self.grid_width, x_dim)
+        self.y_embedding = nn.Embedding(self.grid_height, y_dim)
+
+    @property
+    def out_dim(self) -> int:
+        return self.emb_dim
+
+    def patch_indices(self, xy: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = xy[..., 0].clamp(0.0, 1.0)
+        y = xy[..., 1].clamp(0.0, 1.0)
+        x_idx = torch.floor(x * self.grid_width).long().clamp(0, self.grid_width - 1)
+        y_idx = torch.floor(y * self.grid_height).long().clamp(0, self.grid_height - 1)
+        return y_idx, x_idx
+
+    def forward(self, xy: torch.Tensor) -> torch.Tensor:
+        y_idx, x_idx = self.patch_indices(xy)
+        return torch.cat([self.x_embedding(x_idx), self.y_embedding(y_idx)], dim=-1)
+
+
 def _resolve_wan_model_dir(model_name: str, model_root: Optional[str] = None) -> Path:
     root = Path(model_root or os.environ.get("WAN_MODEL_DIR", "wan_models"))
     if root.name == model_name or (root / "Wan2.1_VAE.pth").exists():
@@ -86,8 +167,17 @@ class UIActionNodeConditioner(nn.Module):
         action_noop_type: int = 5,
         action_type_emb_dim: int = 64,
         action_fourier_freqs: int = 8,
+        action_embedding_recipe: str = "dfot_exact",
+        action_coord_encoding: str = "dfot_s3_fourier",
+        action_coord_space: str = "wan_patch_grid",
+        action_patch_grid_height: int = 30,
+        action_patch_grid_width: int = 52,
+        action_coord_emb_dim: int = 64,
+        action_token_dim: int = 1024,
         action_spatial_hidden_dim: int = 32,
         action_spatial_sigma: float = 0.035,
+        target_width: int = 832,
+        target_height: int = 480,
         node_token_dim: int = 1024,
         hidden_dim: int = 256,
         action_dropout: float = 0.0,
@@ -99,6 +189,13 @@ class UIActionNodeConditioner(nn.Module):
         self.action_num_types = int(action_num_types)
         self.action_noop_type = int(action_noop_type)
         self.action_spatial_sigma = float(action_spatial_sigma)
+        self.action_embedding_recipe = str(action_embedding_recipe)
+        self.action_coord_encoding_name = self._resolve_action_coord_encoding(
+            self.action_embedding_recipe,
+            str(action_coord_encoding),
+        )
+        self.action_coord_space = str(action_coord_space)
+        self.action_token_dim = int(action_token_dim)
         self.node_token_dim = int(node_token_dim)
         self.hidden_dim = int(hidden_dim)
         self.action_dropout = float(action_dropout)
@@ -117,8 +214,13 @@ class UIActionNodeConditioner(nn.Module):
             self.action_num_types,
             int(action_type_emb_dim),
         )
-        self.action_position_encoding = UIActionPositionEncoding(
+        self.action_position_encoding = self._build_action_position_encoding(
             n_freqs=int(action_fourier_freqs),
+            grid_height=int(action_patch_grid_height),
+            grid_width=int(action_patch_grid_width),
+            coord_emb_dim=int(action_coord_emb_dim),
+            target_width=int(target_width),
+            target_height=int(target_height),
         )
         action_feature_dim = int(action_type_emb_dim) + self.action_position_encoding.out_dim
         self.action_global_proj = nn.Sequential(
@@ -126,6 +228,12 @@ class UIActionNodeConditioner(nn.Module):
             nn.Linear(action_feature_dim, self.hidden_dim),
             nn.SiLU(),
             nn.Linear(self.hidden_dim, latent_channels),
+        )
+        self.action_token_proj = nn.Sequential(
+            FP32LayerNorm(action_feature_dim),
+            nn.Linear(action_feature_dim, self.hidden_dim),
+            nn.SiLU(),
+            nn.Linear(self.hidden_dim, self.action_token_dim),
         )
         self.action_spatial_proj = nn.Sequential(
             nn.Conv2d(self.action_num_types + 1, int(action_spatial_hidden_dim), kernel_size=1),
@@ -139,6 +247,55 @@ class UIActionNodeConditioner(nn.Module):
         self.v_proj = nn.Linear(self.node_token_dim, self.hidden_dim)
         self.node_out = nn.Linear(self.hidden_dim, latent_channels)
         self.node_gate = nn.Parameter(torch.full((1,), 1e-3))
+
+    @staticmethod
+    def _resolve_action_coord_encoding(recipe: str, coord_encoding: str) -> str:
+        if recipe == "dfot_exact":
+            return "dfot_s3_fourier"
+        if recipe == "patch_discrete":
+            return "patch_discrete"
+        if recipe == "centered_polar":
+            return "centered_polar_fourier"
+        if recipe != "custom":
+            raise ValueError(
+                "action_embedding_recipe must be one of "
+                "'dfot_exact', 'patch_discrete', 'centered_polar', or 'custom'."
+            )
+        if coord_encoding not in {
+            "dfot_s3_fourier",
+            "patch_discrete",
+            "centered_polar_fourier",
+        }:
+            raise ValueError(f"Unsupported action_coord_encoding: {coord_encoding!r}")
+        return coord_encoding
+
+    def _build_action_position_encoding(
+        self,
+        *,
+        n_freqs: int,
+        grid_height: int,
+        grid_width: int,
+        coord_emb_dim: int,
+        target_width: int,
+        target_height: int,
+    ) -> nn.Module:
+        if self.action_coord_space != "wan_patch_grid":
+            raise ValueError("Only action_coord_space='wan_patch_grid' is supported.")
+        if self.action_coord_encoding_name == "dfot_s3_fourier":
+            return UIActionPositionEncoding(n_freqs=n_freqs)
+        if self.action_coord_encoding_name == "patch_discrete":
+            return UIPatchDiscretePositionEncoding(
+                grid_height=grid_height,
+                grid_width=grid_width,
+                emb_dim=coord_emb_dim,
+            )
+        if self.action_coord_encoding_name == "centered_polar_fourier":
+            return UICenteredPolarPositionEncoding(
+                n_freqs=n_freqs,
+                target_width=target_width,
+                target_height=target_height,
+            )
+        raise ValueError(f"Unsupported action coordinate encoding: {self.action_coord_encoding_name!r}")
 
     def enable_trainable_parameters(self) -> None:
         self.requires_grad_(True)
@@ -155,6 +312,55 @@ class UIActionNodeConditioner(nn.Module):
             keep = keep.unsqueeze(-1)
         return value * keep.to(dtype=value.dtype)
 
+    def prepare_action_condition(
+        self,
+        action_cond: torch.Tensor,
+        *,
+        device: torch.device,
+        drop_action: bool = True,
+    ) -> torch.Tensor:
+        action_dtype = self.action_type_embedding.weight.dtype
+        action_cond = action_cond.to(device=device, dtype=action_dtype)
+        if drop_action:
+            action_cond = self._drop_frame_condition(action_cond, self.action_dropout)
+        return action_cond
+
+    def _action_components(
+        self,
+        action_cond: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        clean = torch.nan_to_num(
+            action_cond[..., :3].float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        raw_type = clean[..., 0]
+        xy = clean[..., 1:3].clamp(0.0, 1.0)
+        action_type = raw_type.round().long().clamp(0, self.action_num_types - 1)
+
+        null_row = clean.abs().amax(dim=-1) < 1e-8
+        noop_row = action_type == self.action_noop_type
+        valid = ~(null_row | noop_row)
+        valid_f = valid.to(dtype=dtype)
+        return clean, action_type, xy, valid_f
+
+    def _action_feature(
+        self,
+        action_type: torch.Tensor,
+        xy: torch.Tensor,
+    ) -> torch.Tensor:
+        action_feature_dtype = self.action_type_embedding.weight.dtype
+        return torch.cat(
+            [
+                self.action_type_embedding(action_type).to(dtype=action_feature_dtype),
+                self.action_position_encoding(xy.float()).to(dtype=action_feature_dtype),
+            ],
+            dim=-1,
+        )
+
     def _encode_action_condition(
         self,
         action_cond: torch.Tensor,
@@ -170,29 +376,8 @@ class UIActionNodeConditioner(nn.Module):
             )
 
         device = action_cond.device
-        clean = torch.nan_to_num(
-            action_cond[..., :3].float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        raw_type = clean[..., 0]
-        xy = clean[..., 1:3].clamp(0.0, 1.0)
-        action_type = raw_type.round().long().clamp(0, self.action_num_types - 1)
-
-        null_row = clean.abs().amax(dim=-1) < 1e-8
-        noop_row = action_type == self.action_noop_type
-        valid = ~(null_row | noop_row)
-        valid_f = valid.to(dtype=dtype)
-
-        action_feature_dtype = self.action_global_proj[1].weight.dtype
-        action_feature = torch.cat(
-            [
-                self.action_type_embedding(action_type).to(dtype=action_feature_dtype),
-                self.action_position_encoding(xy.float()).to(dtype=action_feature_dtype),
-            ],
-            dim=-1,
-        )
+        _, action_type, xy, valid_f = self._action_components(action_cond, dtype=dtype)
+        action_feature = self._action_feature(action_type, xy)
         global_residual = self.action_global_proj(action_feature).to(dtype=dtype)
         global_residual = global_residual * valid_f[..., None]
 
@@ -231,6 +416,34 @@ class UIActionNodeConditioner(nn.Module):
 
         return spatial_residual + global_residual[..., None, None]
 
+    def build_action_tokens(
+        self,
+        action_cond: torch.Tensor,
+        *,
+        height: int,
+        width: int,
+        dtype: torch.dtype,
+        drop_action: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if action_cond.ndim != 3 or action_cond.shape[-1] < 3:
+            raise ValueError(
+                "action_cond must have shape [B, F, >=3], got "
+                f"{tuple(action_cond.shape)}."
+            )
+        del height, width
+        action_cond = self.prepare_action_condition(
+            action_cond,
+            device=action_cond.device,
+            drop_action=drop_action,
+        )
+        _, action_type, xy, valid_f = self._action_components(action_cond, dtype=dtype)
+        action_feature = self._action_feature(action_type, xy)
+        token = self.action_token_proj(action_feature).to(dtype=dtype).unsqueeze(-2)
+        mask = valid_f.bool().unsqueeze(-1)
+        positions = xy.to(dtype=dtype).unsqueeze(-2)
+        token = token * valid_f[..., None, None]
+        return token, mask, positions
+
     def forward(
         self,
         latents: torch.Tensor,
@@ -238,6 +451,7 @@ class UIActionNodeConditioner(nn.Module):
         action_cond: Optional[torch.Tensor] = None,
         node_tokens: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
+        drop_action: bool = True,
     ) -> torch.Tensor:
         # latents: [B, F, C, H, W]
         out = latents
@@ -249,10 +463,10 @@ class UIActionNodeConditioner(nn.Module):
                     "action_cond frame shape must match latents: "
                     f"got {tuple(action_cond.shape[:2])}, expected {tuple(latents.shape[:2])}."
                 )
-            action_dtype = self.action_type_embedding.weight.dtype
-            action_cond = self._drop_frame_condition(
-                action_cond.to(device=latents.device, dtype=action_dtype),
-                self.action_dropout,
+            action_cond = self.prepare_action_condition(
+                action_cond,
+                device=latents.device,
+                drop_action=drop_action,
             )
             action_residual = self._encode_action_condition(
                 action_cond,
@@ -452,13 +666,22 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.ui_conditioner = None
         self.node_conditioning_enabled = False
         self.block_cross_attn_enabled = False
+        self.action_block_cross_attn_enabled = False
+        self.require_graph_token_positions = False
         self.train_ui_conditioner_only = False
         self.train_condition_cross_attn_only = False
         if ui_conditioning is not None and bool(ui_conditioning.get("enabled", False)):
             node_token_dim = int(ui_conditioning.get("node_token_dim", 1024))
             node_dropout = float(ui_conditioning.get("node_dropout", 0.0))
             node_attention_dropout = float(ui_conditioning.get("node_attention_dropout", 0.0))
+            action_attention_dropout = float(ui_conditioning.get("action_attention_dropout", 0.0))
+            action_token_dim = int(ui_conditioning.get("action_token_dim", node_token_dim))
+            condition_position_encoding = str(
+                ui_conditioning.get("condition_position_encoding", "learned_projection")
+            )
             self.block_cross_attn_enabled = bool(ui_conditioning.get("block_cross_attn", False))
+            self.action_block_cross_attn_enabled = bool(ui_conditioning.get("action_block_cross_attn", False))
+            self.require_graph_token_positions = bool(ui_conditioning.get("require_graph_token_positions", False))
             has_node_token_dim = (
                 hasattr(ui_conditioning, "__contains__")
                 and "node_token_dim" in ui_conditioning
@@ -472,6 +695,16 @@ class WanDiffusionWrapper(torch.nn.Module):
                 self.model.add_condition_cross_attention(
                     condition_dim=node_token_dim,
                     dropout=node_attention_dropout,
+                    position_encoding=condition_position_encoding,
+                )
+            if self.action_block_cross_attn_enabled:
+                add_action_cross_attn = getattr(self.model, "add_action_condition_cross_attention", None)
+                if add_action_cross_attn is None:
+                    raise ValueError("WAN model does not support action condition cross-attention.")
+                add_action_cross_attn(
+                    condition_dim=action_token_dim,
+                    dropout=action_attention_dropout,
+                    position_encoding=condition_position_encoding,
                 )
             self.ui_conditioner = UIActionNodeConditioner(
                 latent_channels=int(ui_conditioning.get("latent_channels", 16)),
@@ -480,8 +713,17 @@ class WanDiffusionWrapper(torch.nn.Module):
                 action_noop_type=int(ui_conditioning.get("action_noop_type", 5)),
                 action_type_emb_dim=int(ui_conditioning.get("action_type_emb_dim", 64)),
                 action_fourier_freqs=int(ui_conditioning.get("action_fourier_freqs", 8)),
+                action_embedding_recipe=str(ui_conditioning.get("action_embedding_recipe", "dfot_exact")),
+                action_coord_encoding=str(ui_conditioning.get("action_coord_encoding", "dfot_s3_fourier")),
+                action_coord_space=str(ui_conditioning.get("action_coord_space", "wan_patch_grid")),
+                action_patch_grid_height=int(ui_conditioning.get("action_patch_grid_height", 30)),
+                action_patch_grid_width=int(ui_conditioning.get("action_patch_grid_width", 52)),
+                action_coord_emb_dim=int(ui_conditioning.get("action_coord_emb_dim", 64)),
+                action_token_dim=action_token_dim,
                 action_spatial_hidden_dim=int(ui_conditioning.get("action_spatial_hidden_dim", 32)),
                 action_spatial_sigma=float(ui_conditioning.get("action_spatial_sigma", 0.035)),
+                target_width=int(ui_conditioning.get("target_width", 832)),
+                target_height=int(ui_conditioning.get("target_height", 480)),
                 node_token_dim=node_token_dim,
                 hidden_dim=int(ui_conditioning.get("hidden_dim", 256)),
                 action_dropout=float(ui_conditioning.get("action_dropout", 0.0)),
@@ -509,6 +751,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         set_condition_grad = getattr(self.model, "set_condition_cross_attention_requires_grad", None)
         if set_condition_grad is not None:
             set_condition_grad(True)
+        set_action_condition_grad = getattr(self.model, "set_action_condition_cross_attention_requires_grad", None)
+        if set_action_condition_grad is not None:
+            set_action_condition_grad(True)
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
@@ -608,23 +853,48 @@ class WanDiffusionWrapper(torch.nn.Module):
         noisy_image_or_video: torch.Tensor,
         conditional_dict: dict,
         current_start: Optional[int],
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if self.ui_conditioner is None and not self.block_cross_attn_enabled:
-            return noisy_image_or_video, None, None
+    ) -> tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        action_block_cross_attn_enabled = bool(getattr(self, "action_block_cross_attn_enabled", False))
+        block_cross_attn_enabled = bool(getattr(self, "block_cross_attn_enabled", False))
+        if self.ui_conditioner is None and not (block_cross_attn_enabled or action_block_cross_attn_enabled):
+            return noisy_image_or_video, None, None, None, None, None, None
         if "action_cond" not in conditional_dict and "node_tokens" not in conditional_dict:
-            return noisy_image_or_video, None, None
+            return noisy_image_or_video, None, None, None, None, None, None
 
         frames = noisy_image_or_video.shape[1]
         frame_start = int(conditional_dict.get("ui_frame_start", self._frame_start_from_tokens(current_start)))
         action_cond = conditional_dict.get("action_cond")
         node_tokens = conditional_dict.get("node_tokens")
         node_mask = conditional_dict.get("node_mask")
+        node_positions = conditional_dict.get("node_positions")
         if action_cond is not None:
             action_cond = self._slice_condition(action_cond.to(device=noisy_image_or_video.device), frame_start, frames)
         if node_tokens is not None:
             node_tokens = self._slice_condition(node_tokens.to(device=noisy_image_or_video.device), frame_start, frames)
         if node_mask is not None:
             node_mask = self._slice_condition(node_mask.to(device=noisy_image_or_video.device), frame_start, frames)
+        if node_positions is not None:
+            node_positions = self._slice_condition(node_positions.to(device=noisy_image_or_video.device), frame_start, frames)
+
+        action_tokens = None
+        action_mask = None
+        action_positions = None
+        if self.ui_conditioner is not None and action_cond is not None:
+            prepare_action_condition = getattr(self.ui_conditioner, "prepare_action_condition", None)
+            if prepare_action_condition is not None:
+                action_cond = prepare_action_condition(
+                    action_cond,
+                    device=noisy_image_or_video.device,
+                    drop_action=True,
+                )
 
         if self.ui_conditioner is not None:
             noisy_image_or_video = self.ui_conditioner(
@@ -632,11 +902,23 @@ class WanDiffusionWrapper(torch.nn.Module):
                 action_cond=action_cond,
                 node_tokens=node_tokens if self.node_conditioning_enabled and not self.block_cross_attn_enabled else None,
                 node_mask=node_mask if self.node_conditioning_enabled and not self.block_cross_attn_enabled else None,
+                drop_action=False,
             )
-        if not self.node_conditioning_enabled or not self.block_cross_attn_enabled:
+            if action_block_cross_attn_enabled and action_cond is not None:
+                action_tokens, action_mask, action_positions = self.ui_conditioner.build_action_tokens(
+                    action_cond,
+                    height=noisy_image_or_video.shape[-2],
+                    width=noisy_image_or_video.shape[-1],
+                    dtype=noisy_image_or_video.dtype,
+                    drop_action=False,
+                )
+        if not self.node_conditioning_enabled or not block_cross_attn_enabled:
             node_tokens = None
             node_mask = None
-        return noisy_image_or_video, node_tokens, node_mask
+            node_positions = None
+        elif bool(getattr(self, "require_graph_token_positions", False)) and node_tokens is not None and node_positions is None:
+            raise ValueError("Graph-token positions are required but missing from the UI condition dict.")
+        return noisy_image_or_video, node_tokens, node_mask, node_positions, action_tokens, action_mask, action_positions
 
     def forward(
         self,
@@ -653,7 +935,15 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
-        noisy_image_or_video, condition_tokens, condition_mask = self._prepare_ui_conditioning(
+        (
+            noisy_image_or_video,
+            condition_tokens,
+            condition_mask,
+            condition_positions,
+            action_tokens,
+            action_mask,
+            action_positions,
+        ) = self._prepare_ui_conditioning(
             noisy_image_or_video,
             conditional_dict,
             current_start=current_start,
@@ -678,6 +968,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                 cache_start=cache_start,
                 condition_tokens=condition_tokens,
                 condition_mask=condition_mask,
+                condition_positions=condition_positions,
+                action_tokens=action_tokens,
+                action_mask=action_mask,
+                action_positions=action_positions,
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -690,6 +984,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                     aug_t=aug_t,
                     condition_tokens=condition_tokens,
                     condition_mask=condition_mask,
+                    condition_positions=condition_positions,
+                    action_tokens=action_tokens,
+                    action_mask=action_mask,
+                    action_positions=action_positions,
                 ).permute(0, 2, 1, 3, 4)
             else:
                 # diffusion forcing or bidirectional
@@ -705,6 +1003,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                         concat_time_embeddings=concat_time_embeddings,
                         condition_tokens=condition_tokens,
                         condition_mask=condition_mask,
+                        condition_positions=condition_positions,
+                        action_tokens=action_tokens,
+                        action_mask=action_mask,
+                        action_positions=action_positions,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
@@ -714,6 +1016,10 @@ class WanDiffusionWrapper(torch.nn.Module):
                         seq_len=self.seq_len,
                         condition_tokens=condition_tokens,
                         condition_mask=condition_mask,
+                        condition_positions=condition_positions,
+                        action_tokens=action_tokens,
+                        action_mask=action_mask,
+                        action_positions=action_positions,
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

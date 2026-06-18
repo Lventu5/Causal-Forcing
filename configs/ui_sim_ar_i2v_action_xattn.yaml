@@ -1,9 +1,9 @@
 trainer: diffusion
-training_stage: action_node_stage1
+training_stage: action_stage1_actionxattn
 dataset_type: ui_sim_latent
 data_path: ${oc.env:UI_SIM_CF_LATENT_CACHE,dataset/ui_sim_latents/training}
-generator_ckpt: ${oc.env:CF_UI_NODE_CA_WARMUP_CKPT,checkpoints/ui_sim/action_node_ca_warmup/model.pt}
-allow_partial_generator_load: false
+generator_ckpt: ${oc.env:CF_UI_ACTIONMAP_CKPT,checkpoints/ui_sim/action_stage1_actionmap/model.pt}
+allow_partial_generator_load: true
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -31,9 +31,6 @@ ui_source_width: 1024
 ui_source_height: 768
 ui_action_coordinate_mode: legacy_normalized_source
 ui_random_clip: true
-ui_graph_tokens_per_frame: 32
-ui_graph_token_dim: 1024
-ui_graph_token_has_mask: true
 
 element_loss:
   enabled: false
@@ -54,15 +51,22 @@ model_kwargs:
   ui_conditioning:
     enabled: true
     action_dim: 3
-    node_token_dim: 1024
     latent_channels: 16
     hidden_dim: 256
-    block_cross_attn: true
-    require_graph_token_positions: true
-    condition_position_encoding: ${oc.env:UI_CONDITION_POSITION_ENCODING,learned_projection}
     action_dropout: 0.10
-    node_dropout: 0.10
-    node_attention_dropout: 0.0
+    action_block_cross_attn: true
+    action_attention_dropout: 0.0
+    action_token_dim: 1024
+    condition_position_encoding: ${oc.env:UI_CONDITION_POSITION_ENCODING,rope_2d}
+    action_embedding_recipe: ${oc.env:UI_ACTION_EMBEDDING_RECIPE,dfot_exact}
+    action_coord_encoding: ${oc.env:UI_ACTION_COORD_ENCODING,dfot_s3_fourier}
+    action_coord_space: wan_patch_grid
+    action_patch_grid_height: 30
+    action_patch_grid_width: 52
+    action_coord_emb_dim: 64
+    target_width: 832
+    target_height: 480
+    node_dropout: 0.0
 
 teacher_forcing: true
 load_raw_video: false

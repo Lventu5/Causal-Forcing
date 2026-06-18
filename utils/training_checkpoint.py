@@ -18,6 +18,7 @@ KNOWN_STAGES = (
     "action_node_ca_warmup",
     "action_node_stage2",
     "action_node_stage1",
+    "action_stage1_actionxattn",
     "action_stage1_actionmap",
     "action_stage3_dmd",
     "action_stage2",

@@ -11,6 +11,8 @@ from torch.utils.data import Dataset
 
 from utils.ui_sim_conditioning import (
     LetterboxSpec,
+    graph_token_sidecar_path,
+    load_graph_token_positions,
     normalize_action_coordinates,
     unpack_packed_graph_tokens,
 )
@@ -123,6 +125,18 @@ def _load_referenced_rows(path_value: str | Path, *, start: int, num_frames: int
     return _slice_source_rows(rows, start=start, num_frames=num_frames)
 
 
+def _nested_get(value: Any, *keys: str, default: Any = None) -> Any:
+    out = value
+    for key in keys:
+        if out is None:
+            return default
+        if hasattr(out, "get"):
+            out = out.get(key, default)
+        else:
+            out = getattr(out, key, default)
+    return out
+
+
 class UISimLatentDataset(Dataset):
     """Latent-cache dataset for CF++ UI simulator training.
 
@@ -151,6 +165,40 @@ class UISimLatentDataset(Dataset):
         self.tokens_per_frame = int(getattr(config, "ui_graph_tokens_per_frame", 32))
         self.graph_token_dim = int(getattr(config, "ui_graph_token_dim", 1024))
         self.graph_token_has_mask = bool(getattr(config, "ui_graph_token_has_mask", True))
+        self.require_graph_token_positions = bool(
+            _nested_get(
+                config,
+                "model_kwargs",
+                "ui_conditioning",
+                "require_graph_token_positions",
+                default=False,
+            )
+        )
+
+    def _load_node_positions(
+        self,
+        token_path_value: str | Path | None,
+        *,
+        start: int,
+    ) -> torch.Tensor | None:
+        if token_path_value is None:
+            if self.require_graph_token_positions:
+                raise FileNotFoundError(
+                    "Graph-token positions are required, but this UI latent sample "
+                    "does not provide a node-token sidecar path."
+                )
+            return None
+        token_path = Path(token_path_value)
+        if not token_path.exists():
+            if self.require_graph_token_positions:
+                raise FileNotFoundError(f"Missing graph-token sidecar: {token_path}")
+            return None
+        return load_graph_token_positions(
+            token_path,
+            start=start,
+            num_frames=self.num_frames,
+            tokens_per_frame=self.tokens_per_frame,
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -248,6 +296,14 @@ class UISimLatentDataset(Dataset):
             if "node_mask" in payload:
                 node_mask = torch.as_tensor(payload["node_mask"]).bool()
                 out["node_mask"] = _slice_source_rows(node_mask, start=start, num_frames=self.num_frames)
+            if "node_positions" in payload:
+                node_positions = _as_tensor(payload["node_positions"])
+                out["node_positions"] = _slice_source_rows(node_positions, start=start, num_frames=self.num_frames)
+            else:
+                token_path = payload.get("node_tokens_path")
+                positions = self._load_node_positions(token_path, start=start)
+                if positions is not None:
+                    out["node_positions"] = positions
         elif "node_emb" in payload or "node_cond" in payload:
             packed = _as_tensor(payload.get("node_emb", payload.get("node_cond")))
             packed = _slice_source_rows(packed, start=start, num_frames=self.num_frames)
@@ -260,6 +316,10 @@ class UISimLatentDataset(Dataset):
             out["node_tokens"] = tokens
             if mask is not None:
                 out["node_mask"] = mask
+            token_path = payload.get("node_tokens_path")
+            positions = self._load_node_positions(token_path, start=start)
+            if positions is not None:
+                out["node_positions"] = positions
         elif "node_emb_path" in payload or "node_cond_path" in payload:
             node_path = payload.get("node_emb_path", payload.get("node_cond_path"))
             node_start = int(payload.get("node_emb_start", start_frame))
@@ -273,6 +333,10 @@ class UISimLatentDataset(Dataset):
             out["node_tokens"] = tokens
             if mask is not None:
                 out["node_mask"] = mask
+            token_path = payload.get("node_tokens_path") or graph_token_sidecar_path(node_path)
+            positions = self._load_node_positions(token_path, start=node_start)
+            if positions is not None:
+                out["node_positions"] = positions
 
         return out
 
