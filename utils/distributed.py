@@ -1,6 +1,8 @@
 from datetime import timedelta
 from functools import partial
+import inspect
 import os
+import socket
 import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullStateDictConfig, FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, StateDictType
@@ -96,14 +98,47 @@ def launch_distributed_job(backend: str = "nccl"):
     world_size = int(os.environ["WORLD_SIZE"])
     host = os.environ["MASTER_ADDR"]
     port = int(os.environ["MASTER_PORT"])
+    device_id = None
+
+    if backend == "nccl":
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL distributed launch requires CUDA.")
+        device_count = torch.cuda.device_count()
+        if local_rank >= device_count:
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} but only {device_count} CUDA devices "
+                "are visible. Check Slurm GPU allocation and CUDA_VISIBLE_DEVICES."
+            )
+        torch.cuda.set_device(local_rank)
+        device_id = torch.device("cuda", local_rank)
 
     if ":" in host:  # IPv6
         init_method = f"tcp://[{host}]:{port}"
     else:  # IPv4
         init_method = f"tcp://{host}:{port}"
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend,
-                            init_method=init_method, timeout=timedelta(minutes=30))
-    torch.cuda.set_device(local_rank)
+
+    init_kwargs = {
+        "rank": rank,
+        "world_size": world_size,
+        "backend": backend,
+        "init_method": init_method,
+        "timeout": timedelta(minutes=30),
+    }
+    if (
+        device_id is not None
+        and "device_id" in inspect.signature(dist.init_process_group).parameters
+    ):
+        init_kwargs["device_id"] = device_id
+
+    print(
+        "distributed init: "
+        f"rank={rank}/{world_size} local_rank={local_rank} "
+        f"host={socket.gethostname()} master={host}:{port} "
+        f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')} "
+        f"device_id={device_id}",
+        flush=True,
+    )
+    dist.init_process_group(**init_kwargs)
 
 
 class EMA_FSDP:
