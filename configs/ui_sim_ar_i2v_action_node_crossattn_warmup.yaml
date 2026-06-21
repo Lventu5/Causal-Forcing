@@ -27,6 +27,7 @@ num_frames: 21
 vae_decode_mode: single_frame
 
 ui_prompt: desktop file manager UI transition
+ui_prompt_mode: graph_paths
 ui_source_width: 1024
 ui_source_height: 768
 ui_action_coordinate_mode: legacy_normalized_source
@@ -80,7 +81,7 @@ num_workers: 8
 pin_memory: true
 persistent_workers: true
 prefetch_factor: 2
-cache_text_embeddings: true
+cache_text_embeddings: false
 gc_interval: 0
 ema_weight: 0.99
 ema_start_step: 2000000000

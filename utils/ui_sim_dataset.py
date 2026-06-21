@@ -16,6 +16,7 @@ from utils.ui_sim_conditioning import (
     normalize_action_coordinates,
     unpack_packed_graph_tokens,
 )
+from utils.ui_sim_prompts import FIXED_PROMPT_MODE, UI_PROMPT_MODES
 
 
 DEFAULT_PROMPT = "desktop file manager UI transition"
@@ -157,6 +158,13 @@ class UISimLatentDataset(Dataset):
             self.num_frames = int(config.image_or_video_shape[1])
         self.random_clip = bool(getattr(config, "ui_random_clip", True))
         self.prompt = str(getattr(config, "ui_prompt", DEFAULT_PROMPT))
+        self.prompt_mode = str(
+            getattr(config, "ui_prompt_mode", FIXED_PROMPT_MODE)
+        ).strip().lower()
+        if self.prompt_mode not in UI_PROMPT_MODES:
+            raise ValueError(
+                f"Unsupported ui_prompt_mode {self.prompt_mode!r}; choose from {UI_PROMPT_MODES}."
+            )
         self.target_width = int(getattr(config, "width", 832))
         self.target_height = int(getattr(config, "height", 480))
         self.action_coordinate_mode = str(getattr(config, "ui_action_coordinate_mode", "legacy_normalized_source"))
@@ -249,6 +257,17 @@ class UISimLatentDataset(Dataset):
         }
 
         metadata = payload.get("metadata") or {}
+        payload_prompt_mode = str(
+            payload.get("prompt_mode")
+            or metadata.get("prompt_mode")
+            or FIXED_PROMPT_MODE
+        ).strip().lower()
+        if payload_prompt_mode != self.prompt_mode:
+            raise ValueError(
+                "UI latent cache prompt mode mismatch: config requires "
+                f"{self.prompt_mode!r}, but sample {(out['sample_path'] or idx)!r} uses "
+                f"{payload_prompt_mode!r}. Rebuild the latent cache with matching block prompts."
+            )
         base_start = int(
             payload.get(
                 "start_frame",

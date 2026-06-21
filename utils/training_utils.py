@@ -89,6 +89,13 @@ def maybe_cache_text_encoder(
     if not bool(getattr(config, "cache_text_embeddings", False)):
         return text_encoder
 
+    prompt_mode = str(getattr(config, "ui_prompt_mode", "fixed")).strip().lower()
+    if prompt_mode != "fixed":
+        raise ValueError(
+            "cache_text_embeddings=true only supports ui_prompt_mode='fixed'. "
+            "Use cache_text_embeddings=false for graph-derived block prompts."
+        )
+
     positive_prompt = str(getattr(config, "ui_prompt"))
     negative_prompt = str(getattr(config, "negative_prompt"))
     return CachedTextEncoder.from_encoder(

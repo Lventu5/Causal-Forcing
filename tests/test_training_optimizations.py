@@ -13,6 +13,7 @@ if str(CF_ROOT) not in sys.path:
 from utils.distributed import EMA_FSDP  # noqa: E402
 from utils.training_utils import (  # noqa: E402
     CachedTextEncoder,
+    maybe_cache_text_encoder,
     training_dataloader_kwargs,
     update_ema_model,
 )
@@ -64,6 +65,19 @@ def test_cached_text_encoder_rejects_variable_prompts() -> None:
 
     with pytest.raises(ValueError, match="outside the fixed UI prompt cache"):
         cached(["different prompt"])
+
+
+def test_fixed_embedding_cache_rejects_graph_prompt_mode() -> None:
+    with pytest.raises(ValueError, match="only supports ui_prompt_mode='fixed'"):
+        maybe_cache_text_encoder(
+            CountingTextEncoder(),
+            SimpleNamespace(
+                cache_text_embeddings=True,
+                ui_prompt_mode="graph_paths",
+                ui_prompt="fixed",
+                negative_prompt="negative",
+            ),
+        )
 
 
 def test_training_dataloader_kwargs_enable_async_loading() -> None:
