@@ -71,6 +71,27 @@ def test_graph_frame_states_support_existing_sidecars(tmp_path: Path) -> None:
     ]
 
 
+def test_graph_block_prompt_honors_frame_step() -> None:
+    prompt = prompt_for_block(
+        mode="graph_paths",
+        fixed_prompt="fallback",
+        frame_states=[
+            "desktop:///",
+            "ignored://one",
+            "/home/wmui",
+            "ignored://two",
+            "/home/wmui/Documents",
+        ],
+        start=0,
+        num_frames=3,
+        frame_step=2,
+    )
+
+    assert "ignored" not in prompt
+    assert "the desktop then the Home folder" in prompt
+    assert 'the folder "Documents"' in prompt
+
+
 def test_ui_dataset_rejects_legacy_fixed_prompt_cache_in_graph_mode(tmp_path: Path) -> None:
     sample_path = tmp_path / "legacy.pt"
     torch.save(

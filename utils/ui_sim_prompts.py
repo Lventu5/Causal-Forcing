@@ -65,6 +65,7 @@ def prompt_for_block(
     frame_states: Sequence[str] | None,
     start: int,
     num_frames: int,
+    frame_step: int = 1,
 ) -> str:
     """Return the fixed or graph-derived prompt for one frame interval."""
     mode = str(mode).strip().lower()
@@ -74,14 +75,15 @@ def prompt_for_block(
         return str(fixed_prompt)
     if frame_states is None:
         raise ValueError("graph_paths prompt mode requires graph frame states.")
-    end = int(start) + int(num_frames)
-    if start < 0 or num_frames < 1 or len(frame_states) < end:
+    end = int(start) + (int(num_frames) - 1) * int(frame_step) + 1
+    if start < 0 or num_frames < 1 or frame_step < 1 or len(frame_states) < end:
         raise ValueError(
             "Graph frame states are too short for prompt block "
-            f"start={start}, frames={num_frames}: got {len(frame_states)}, need {end}."
+            f"start={start}, frames={num_frames}, frame_step={frame_step}: "
+            f"got {len(frame_states)}, need {end}."
         )
     return build_ui_block_prompt(
-        frame_states[int(start):end],
+        frame_states[int(start):end:int(frame_step)],
         fixed_prompt=fixed_prompt,
     )
 
