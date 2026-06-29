@@ -62,16 +62,6 @@ class UISimTrainingVisualizer:
                 flush=True,
             )
 
-        self.pipeline = None
-        if self.enabled and self.rollout_interval > 0:
-            self.pipeline = CausalDiffusionInferencePipeline(
-                config,
-                device=device,
-                generator=model.generator,
-                text_encoder=model.text_encoder,
-                vae=model.vae,
-            )
-
     def should_log_denoising(self, step: int) -> bool:
         return (
             self.enabled
@@ -113,6 +103,15 @@ class UISimTrainingVisualizer:
         generator = torch.Generator(device=f"cuda:{self.device}")
         generator.manual_seed(self.seed)
         return generator
+
+    def _new_pipeline(self) -> CausalDiffusionInferencePipeline:
+        return CausalDiffusionInferencePipeline(
+            self.config,
+            device=self.device,
+            generator=self.model.generator,
+            text_encoder=self.model.text_encoder,
+            vae=self.model.vae,
+        )
 
     def _decode(self, latents: torch.Tensor) -> torch.Tensor:
         if getattr(self.config, "vae_decode_mode", "video") == "single_frame":
@@ -184,7 +183,7 @@ class UISimTrainingVisualizer:
         was_training = self.model.generator.training
         self.model.generator.eval()
         try:
-            with torch.no_grad():
+            with torch.inference_mode():
                 conditional_dict = self.model.text_encoder(
                     text_prompts=list(batch["prompts"])
                 )
@@ -237,7 +236,7 @@ class UISimTrainingVisualizer:
             )
 
     def log_rollout(self, step: int) -> None:
-        if self.pipeline is None:
+        if not self.enabled or self.rollout_interval <= 0:
             return
         batch = self._fixed_batch()
         clean_latent, ui_batch = self._clean_latent_and_condition(batch)
@@ -254,11 +253,13 @@ class UISimTrainingVisualizer:
             dtype=self.dtype,
         )
 
-        was_training = self.model.generator.training
-        self.pipeline.eval()
+        generator_was_training = self.model.generator.training
+        text_encoder_was_training = self.model.text_encoder.training
+        pipeline = self._new_pipeline()
+        pipeline.eval()
         try:
-            with torch.no_grad():
-                generated_latent = self.pipeline.inference(
+            with torch.inference_mode():
+                generated_latent = pipeline.inference(
                     noise=noise,
                     text_prompts=list(batch["prompts"]),
                     initial_latent=clean_latent[:, :1],
@@ -266,7 +267,10 @@ class UISimTrainingVisualizer:
                     return_video=False,
                 )
         finally:
-            self.model.generator.train(was_training)
+            self.model.generator.train(generator_was_training)
+            self.model.text_encoder.train(text_encoder_was_training)
+            del pipeline
+            torch.cuda.empty_cache()
 
         if not self.is_main_process:
             return
