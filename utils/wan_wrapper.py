@@ -670,6 +670,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.require_graph_token_positions = False
         self.train_ui_conditioner_only = False
         self.train_condition_cross_attn_only = False
+        self.train_action_condition_cross_attn = True
         if ui_conditioning is not None and bool(ui_conditioning.get("enabled", False)):
             node_token_dim = int(ui_conditioning.get("node_token_dim", 1024))
             node_dropout = float(ui_conditioning.get("node_dropout", 0.0))
@@ -678,6 +679,18 @@ class WanDiffusionWrapper(torch.nn.Module):
             action_token_dim = int(ui_conditioning.get("action_token_dim", node_token_dim))
             condition_position_encoding = str(
                 ui_conditioning.get("condition_position_encoding", "learned_projection")
+            )
+            node_condition_position_encoding = str(
+                ui_conditioning.get(
+                    "node_condition_position_encoding",
+                    condition_position_encoding,
+                )
+            )
+            action_condition_position_encoding = str(
+                ui_conditioning.get(
+                    "action_condition_position_encoding",
+                    condition_position_encoding,
+                )
             )
             self.block_cross_attn_enabled = bool(ui_conditioning.get("block_cross_attn", False))
             self.action_block_cross_attn_enabled = bool(ui_conditioning.get("action_block_cross_attn", False))
@@ -695,7 +708,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 self.model.add_condition_cross_attention(
                     condition_dim=node_token_dim,
                     dropout=node_attention_dropout,
-                    position_encoding=condition_position_encoding,
+                    position_encoding=node_condition_position_encoding,
                 )
             if self.action_block_cross_attn_enabled:
                 add_action_cross_attn = getattr(self.model, "add_action_condition_cross_attention", None)
@@ -704,7 +717,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 add_action_cross_attn(
                     condition_dim=action_token_dim,
                     dropout=action_attention_dropout,
-                    position_encoding=condition_position_encoding,
+                    position_encoding=action_condition_position_encoding,
                 )
             self.ui_conditioner = UIActionNodeConditioner(
                 latent_channels=int(ui_conditioning.get("latent_channels", 16)),
@@ -733,6 +746,9 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.train_condition_cross_attn_only = bool(
                 ui_conditioning.get("condition_cross_attn_only", False)
             )
+            self.train_action_condition_cross_attn = bool(
+                ui_conditioning.get("train_action_condition_cross_attn", True)
+            )
             if self.train_condition_cross_attn_only and not self.block_cross_attn_enabled:
                 raise ValueError("condition_cross_attn_only requires block_cross_attn=true.")
             self.train_ui_conditioner_only = (
@@ -753,7 +769,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             set_condition_grad(True)
         set_action_condition_grad = getattr(self.model, "set_action_condition_cross_attention_requires_grad", None)
         if set_action_condition_grad is not None:
-            set_action_condition_grad(True)
+            set_action_condition_grad(self.train_action_condition_cross_attn)
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()

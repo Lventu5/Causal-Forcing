@@ -57,12 +57,24 @@ model_kwargs:
   ui_conditioning:
     enabled: true
     action_dim: 3
+    action_token_dim: 1024
     node_token_dim: 1024
     latent_channels: 16
     hidden_dim: 256
     block_cross_attn: true
+    action_block_cross_attn: true
     require_graph_token_positions: true
     condition_position_encoding: ${oc.env:UI_CONDITION_POSITION_ENCODING,learned_projection}
+    action_condition_position_encoding: ${oc.env:UI_ACTION_CONDITION_POSITION_ENCODING,rope_2d}
+    action_attention_dropout: 0.0
+    action_embedding_recipe: ${oc.env:UI_ACTION_EMBEDDING_RECIPE,dfot_exact}
+    action_coord_encoding: ${oc.env:UI_ACTION_COORD_ENCODING,dfot_s3_fourier}
+    action_coord_space: wan_patch_grid
+    action_patch_grid_height: 30
+    action_patch_grid_width: 52
+    action_coord_emb_dim: 64
+    target_width: 832
+    target_height: 480
     action_dropout: 0.05
     node_dropout: 0.05
     node_attention_dropout: 0.0

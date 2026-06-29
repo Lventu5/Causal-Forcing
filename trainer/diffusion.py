@@ -66,6 +66,7 @@ class Trainer:
             getattr(config, "memory_log_interval", 100)
         )
         self.log_interval = int(getattr(config, "log_iters", 1))
+        self.max_train_steps = int(getattr(config, "max_train_steps", 0) or 0)
 
         # use a random seed for the training
         if config.seed == 0:
@@ -491,3 +492,14 @@ class Trainer:
                     self.visualizer.log_rollout,
                 )
                 barrier()
+            if (
+                self.max_train_steps > 0
+                and self.step - self.run_start_step >= self.max_train_steps
+            ):
+                if dist.get_rank() == 0:
+                    logging.info(
+                        "Reached max_train_steps=%d after %d new steps; stopping.",
+                        self.max_train_steps,
+                        self.step - self.run_start_step,
+                    )
+                break
