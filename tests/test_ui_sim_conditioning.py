@@ -338,6 +338,27 @@ def test_ui_training_visualizer_intervals() -> None:
     assert not visualizer.should_log_rollout(4000)
 
 
+def test_ui_training_visualizer_keeps_node_positions() -> None:
+    visualizer = UISimTrainingVisualizer.__new__(UISimTrainingVisualizer)
+    visualizer.device = torch.device("cpu")
+    visualizer.dtype = torch.float32
+    visualizer.num_frames = 3
+
+    batch = {
+        "clean_latent": torch.zeros(1, 4, 16, 2, 2),
+        "actions": torch.zeros(1, 3, 3),
+        "node_tokens": torch.zeros(1, 3, 2, 4),
+        "node_mask": torch.ones(1, 3, 2, dtype=torch.bool),
+        "node_positions": torch.rand(1, 3, 2, 2),
+    }
+
+    clean_latent, ui_batch = visualizer._clean_latent_and_condition(batch)
+
+    assert clean_latent.shape[1] == 3
+    assert set(ui_batch) == {"actions", "node_tokens", "node_mask", "node_positions"}
+    assert torch.equal(ui_batch["node_positions"], batch["node_positions"])
+
+
 def test_causal_wan_rebuilds_block_mask_for_visualization_shape(
     monkeypatch,
 ) -> None:
@@ -593,6 +614,33 @@ def test_wan_cross_attention_handles_masked_frame_conditions() -> None:
     assert residual.shape == x.shape
     assert torch.isfinite(residual).all()
     assert torch.equal(residual[:, 4:], torch.zeros_like(residual[:, 4:]))
+
+
+def test_wan_cross_attention_stores_reduced_attention_maps() -> None:
+    module = WanCrossAttention(dim=8, num_heads=2, condition_dim=4)
+    module.store_attn_weights = True
+    x = torch.randn(1, 6, 8)
+    tokens = torch.randn(1, 3, 2, 4)
+    mask = torch.tensor([[[True, False], [True, True], [False, False]]])
+
+    residual = module(
+        x,
+        tokens,
+        mask,
+        num_frames=3,
+        frame_seqlen=2,
+        grid_sizes=torch.tensor([[3, 1, 2]]),
+    )
+
+    assert residual.shape == x.shape
+    assert module.last_attn_slot_map.shape == (3, 2)
+    assert module.last_attn_patch_map.shape == (3, 2, 2)
+    assert module.last_attn_num_frames == 3
+    assert module.last_attn_tokens_per_frame == 2
+    assert module.last_attn_frame_seqlen == 2
+    assert module.last_attn_grid_hw == (1, 2)
+    assert torch.equal(module.last_attn_slot_map[2], torch.zeros(2))
+    assert torch.equal(module.last_attn_patch_map[2], torch.zeros(2, 2))
 
 
 def test_wan_cross_attention_changes_with_condition_positions() -> None:

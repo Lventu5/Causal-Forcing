@@ -107,4 +107,8 @@ visualize_sample_index: 0
 visualize_seed: 0
 visualize_timestep: 500
 visualize_fps: 4
+cross_attn_maps: false
+cross_attn_map_max_blocks: 4
+cross_attn_map_topk: 4
+cross_attn_map_frame_limit: 3
 negative_prompt: low quality, blurry, distorted UI text, wrong action outcome

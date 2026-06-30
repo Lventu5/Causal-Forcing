@@ -323,6 +323,16 @@ class WanCrossAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.gate = nn.Parameter(torch.full((1,), 1e-3))
+        self.store_attn_weights = False
+        self.first_attn_slot_map = None
+        self.first_attn_patch_map = None
+        self.last_attn_slot_map = None
+        self.last_attn_patch_map = None
+        self.last_attn_num_frames = 0
+        self.last_attn_tokens_per_frame = 0
+        self.last_attn_frame_seqlen = 0
+        self.last_attn_grid_hw = None
+        self.last_attn_frame_has_condition = None
 
         nn.init.xavier_uniform_(self.q.weight)
         nn.init.xavier_uniform_(self.k.weight)
@@ -562,11 +572,45 @@ class WanCrossAttention(nn.Module):
             dtype=q.dtype, device=x.device,
         )
         attn_mask = attn_mask.masked_fill(~flat_mask[:, None, None, :], torch.finfo(q.dtype).min)
-        attended = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.dropout if self.training else 0.0,
-        )
+        if self.store_attn_weights:
+            scale = q.shape[-1] ** -0.5
+            scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * scale
+            scores = scores + attn_mask.float()
+            attn_weights = scores.softmax(dim=-1)
+            attn_for_value = (
+                F.dropout(attn_weights, p=self.dropout, training=True)
+                if self.training and self.dropout > 0
+                else attn_weights
+            )
+            attended = torch.matmul(attn_for_value, v.float()).to(dtype=q.dtype)
+
+            frame_keep = frame_has_condition.detach().to(device=attn_weights.device)
+            stored = attn_weights.detach().float()
+            stored = stored * frame_keep[:, None, None, None].float()
+            slot_map = stored.mean(dim=(1, 2)).cpu()
+            patch_map = stored.mean(dim=1).cpu()
+            if self.first_attn_slot_map is None:
+                self.first_attn_slot_map = slot_map
+                self.first_attn_patch_map = patch_map
+            self.last_attn_slot_map = slot_map
+            self.last_attn_patch_map = patch_map
+            self.last_attn_num_frames = int(num_frames)
+            self.last_attn_tokens_per_frame = int(flat_tokens.shape[1])
+            self.last_attn_frame_seqlen = int(frame_seqlen)
+            self.last_attn_frame_has_condition = frame_has_condition.detach().cpu()
+            self.last_attn_grid_hw = None
+            if grid_sizes is not None and len(grid_sizes) > 0:
+                _, grid_h, grid_w = grid_sizes[0].detach().cpu().tolist()
+                grid_h = int(grid_h)
+                grid_w = int(grid_w)
+                if grid_h * grid_w == int(frame_seqlen):
+                    self.last_attn_grid_hw = (grid_h, grid_w)
+        else:
+            attended = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+            )
         attended = attended.transpose(1, 2).flatten(2)
         residual = self.o(attended)
         residual = residual * frame_has_condition[:, None, None].to(dtype=residual.dtype)

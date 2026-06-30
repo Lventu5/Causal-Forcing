@@ -8,11 +8,17 @@ from typing import Any
 import torch
 import wandb
 from torch.utils.data._utils.collate import default_collate
-from torchvision.io import write_video
+from torchvision.io import write_png, write_video
 
 from pipeline import CausalDiffusionInferencePipeline
 from utils.ui_sim_conditioning import attach_ui_batch_conditioning
 from utils.ui_sim_dataset import UISimLatentDataset
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 class UISimTrainingVisualizer:
@@ -44,6 +50,14 @@ class UISimTrainingVisualizer:
         self.seed = int(getattr(config, "visualize_seed", 0))
         self.timestep_index = int(getattr(config, "visualize_timestep", 500))
         self.fps = int(getattr(config, "visualize_fps", 4))
+        self.cross_attn_maps = _as_bool(getattr(config, "cross_attn_maps", False))
+        self.cross_attn_map_max_blocks = int(
+            getattr(config, "cross_attn_map_max_blocks", 4)
+        )
+        self.cross_attn_map_topk = int(getattr(config, "cross_attn_map_topk", 4))
+        self.cross_attn_map_frame_limit = int(
+            getattr(config, "cross_attn_map_frame_limit", 3)
+        )
         self.output_dir = Path(output_path) / "visualizations"
 
         eval_data_path = str(
@@ -94,7 +108,7 @@ class UISimTrainingVisualizer:
         clean_latent = clean_latent[:, :min(self.num_frames, clean_latent.shape[1])]
         ui_batch = {
             key: batch[key]
-            for key in ("actions", "node_tokens", "node_mask")
+            for key in ("actions", "node_tokens", "node_mask", "node_positions")
             if key in batch
         }
         return clean_latent, ui_batch
@@ -154,6 +168,225 @@ class UISimTrainingVisualizer:
         write_video(str(output_path), pixels, fps=self.fps)
         return output_path
 
+    def _graph_cross_attn_modules(self) -> list[tuple[str, Any]]:
+        modules: list[tuple[str, Any]] = []
+        for name, module in self.model.generator.named_modules():
+            if "condition_cross_attn" not in name:
+                continue
+            if "action_condition_cross_attn" in name:
+                continue
+            if module.__class__.__name__ != "WanCrossAttention":
+                continue
+            modules.append((name, module))
+        return modules
+
+    @staticmethod
+    def _clear_cross_attn_module(module: Any) -> None:
+        module.store_attn_weights = False
+        for attr in (
+            "first_attn_slot_map",
+            "first_attn_patch_map",
+            "last_attn_slot_map",
+            "last_attn_patch_map",
+            "last_attn_frame_has_condition",
+        ):
+            if hasattr(module, attr):
+                setattr(module, attr, None)
+
+    def _set_graph_cross_attn_capture(self, enabled: bool) -> list[tuple[str, Any]]:
+        selected: list[tuple[str, Any]] = []
+        max_blocks = self.cross_attn_map_max_blocks
+        for name, module in self._graph_cross_attn_modules():
+            self._clear_cross_attn_module(module)
+            capture = enabled and (max_blocks <= 0 or len(selected) < max_blocks)
+            module.store_attn_weights = capture
+            if capture:
+                selected.append((name, module))
+        return selected
+
+    def _collect_graph_cross_attn_maps(
+        self,
+        modules: list[tuple[str, Any]],
+    ) -> list[dict[str, Any]]:
+        captured: list[dict[str, Any]] = []
+        for block_index, (name, module) in enumerate(modules):
+            slot_map = getattr(module, "last_attn_slot_map", None)
+            patch_map = getattr(module, "last_attn_patch_map", None)
+            if slot_map is None or patch_map is None:
+                continue
+            captured.append(
+                {
+                    "block_index": block_index,
+                    "name": name,
+                    "slot_map": slot_map,
+                    "patch_map": patch_map,
+                    "num_frames": int(getattr(module, "last_attn_num_frames", 0)),
+                    "tokens_per_frame": int(
+                        getattr(module, "last_attn_tokens_per_frame", 0)
+                    ),
+                    "frame_seqlen": int(getattr(module, "last_attn_frame_seqlen", 0)),
+                    "grid_hw": getattr(module, "last_attn_grid_hw", None),
+                }
+            )
+        return captured
+
+    @staticmethod
+    def _heat_to_uint8(heat: torch.Tensor) -> torch.Tensor:
+        heat = torch.nan_to_num(heat.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if heat.numel() == 0:
+            return torch.zeros_like(heat, dtype=torch.uint8)
+        max_value = heat.max()
+        max_scalar = float(max_value.item())
+        if not torch.isfinite(max_value).item() or max_scalar <= 0.0:
+            return torch.zeros_like(heat, dtype=torch.uint8)
+        return (heat / max_value * 255.0).round().clamp(0, 255).to(torch.uint8)
+
+    def _write_heat_png(self, heat: torch.Tensor, name: str) -> Path:
+        image = self._heat_to_uint8(heat).cpu()
+        if image.ndim == 2:
+            image = image.unsqueeze(0)
+        elif image.ndim == 3 and image.shape[-1] in {1, 3, 4}:
+            image = image.permute(2, 0, 1)
+        output_path = self.output_dir / name
+        write_png(image.contiguous(), str(output_path))
+        return output_path
+
+    def _selected_cross_attn_frames(self, slot_map: torch.Tensor) -> list[int]:
+        limit = max(0, self.cross_attn_map_frame_limit)
+        if limit <= 0:
+            return []
+        valid_frames = [
+            frame_idx
+            for frame_idx in range(slot_map.shape[0])
+            if float(slot_map[frame_idx].sum()) > 0.0
+        ]
+        if len(valid_frames) <= limit:
+            return valid_frames
+        if limit == 1:
+            return [valid_frames[-1]]
+        return [
+            valid_frames[round(i * (len(valid_frames) - 1) / (limit - 1))]
+            for i in range(limit)
+        ]
+
+    def _top_cross_attn_slots(self, slot_row: torch.Tensor) -> list[int]:
+        topk = min(max(0, self.cross_attn_map_topk), int(slot_row.numel()))
+        if topk <= 0 or float(slot_row.sum()) <= 0.0:
+            return []
+        return torch.topk(slot_row.float(), k=topk).indices.tolist()
+
+    def _cross_attn_patch_montage(
+        self,
+        patch_frame: torch.Tensor,
+        slots: list[int],
+        grid_hw: tuple[int, int] | None,
+    ) -> torch.Tensor | None:
+        if grid_hw is None or not slots:
+            return None
+        grid_h, grid_w = grid_hw
+        if patch_frame.shape[0] != grid_h * grid_w:
+            return None
+        heatmaps = [
+            self._heat_to_uint8(patch_frame[:, slot].reshape(grid_h, grid_w))
+            for slot in slots
+        ]
+        return torch.cat(heatmaps, dim=1)
+
+    def _graph_cross_attn_top_token_table(
+        self,
+        slot_map: torch.Tensor,
+    ) -> wandb.Table:
+        table = wandb.Table(columns=["frame", "rank", "slot", "weight"])
+        topk = min(max(0, self.cross_attn_map_topk), int(slot_map.shape[-1]))
+        if topk <= 0:
+            return table
+        for frame_idx in range(slot_map.shape[0]):
+            row = slot_map[frame_idx].float()
+            if float(row.sum()) <= 0.0:
+                continue
+            values, slots = torch.topk(row, k=topk)
+            for rank, (slot, value) in enumerate(zip(slots, values), start=1):
+                table.add_data(frame_idx, rank, int(slot), float(value))
+        return table
+
+    def _log_graph_cross_attn_maps(
+        self,
+        captured: list[dict[str, Any]],
+        step: int,
+    ) -> None:
+        if not captured:
+            return
+        wandb_payload: dict[str, Any] = {}
+        for item in captured:
+            block_index = int(item["block_index"])
+            num_frames = max(0, int(item["num_frames"]))
+            slot_map = item["slot_map"]
+            patch_map = item["patch_map"]
+            if num_frames > 0:
+                slot_map = slot_map[:num_frames]
+                patch_map = patch_map[:num_frames]
+
+            slot_path = self._write_heat_png(
+                slot_map,
+                f"cross_attn_block_{block_index:02d}_slots_step_{step:06d}.png",
+            )
+            print(
+                f"[visualization] wrote graph cross-attention slot map to {slot_path}",
+                flush=True,
+            )
+            if not self.disable_wandb:
+                wandb_payload[f"preview/graph_cross_attn_block{block_index}_slots"] = (
+                    wandb.Image(
+                        str(slot_path),
+                        caption=(
+                            f"Graph CA block {block_index}: rows=frames, "
+                            "cols=graph-token slots."
+                        ),
+                    )
+                )
+                wandb_payload[
+                    f"preview/graph_cross_attn_block{block_index}_top_tokens"
+                ] = self._graph_cross_attn_top_token_table(slot_map)
+
+            grid_hw = item["grid_hw"]
+            for frame_idx in self._selected_cross_attn_frames(slot_map):
+                slots = self._top_cross_attn_slots(slot_map[frame_idx])
+                montage = self._cross_attn_patch_montage(
+                    patch_map[frame_idx],
+                    slots,
+                    grid_hw,
+                )
+                if montage is None:
+                    continue
+                patch_path = self._write_heat_png(
+                    montage,
+                    (
+                        f"cross_attn_block_{block_index:02d}_frame_{frame_idx:02d}"
+                        f"_patches_step_{step:06d}.png"
+                    ),
+                )
+                print(
+                    f"[visualization] wrote graph cross-attention patch map to {patch_path} "
+                    f"(frame {frame_idx}, slots {slots})",
+                    flush=True,
+                )
+                if not self.disable_wandb:
+                    wandb_payload[
+                        (
+                            f"preview/graph_cross_attn_block{block_index}"
+                            f"_frame{frame_idx}_patches"
+                        )
+                    ] = wandb.Image(
+                        str(patch_path),
+                        caption=(
+                            f"Graph CA block {block_index}, frame {frame_idx}: "
+                            f"patch heatmaps for token slots {slots}."
+                        ),
+                    )
+
+        if wandb_payload and not self.disable_wandb:
+            wandb.log(wandb_payload, step=step)
+
     def log_denoising(self, step: int) -> None:
         batch = self._fixed_batch()
         clean_latent, ui_batch = self._clean_latent_and_condition(batch)
@@ -182,7 +415,12 @@ class UISimTrainingVisualizer:
 
         was_training = self.model.generator.training
         self.model.generator.eval()
+        capture_attn = self.cross_attn_maps and "node_tokens" in ui_batch
+        captured_attn: list[dict[str, Any]] = []
+        captured_modules: list[tuple[str, Any]] = []
         try:
+            if capture_attn:
+                captured_modules = self._set_graph_cross_attn_capture(True)
             with torch.inference_mode():
                 conditional_dict = self.model.text_encoder(
                     text_prompts=list(batch["prompts"])
@@ -203,7 +441,13 @@ class UISimTrainingVisualizer:
                     clean_x=clean_latent if self.model.teacher_forcing else None,
                     aug_t=None,
                 )
+                if capture_attn:
+                    captured_attn = self._collect_graph_cross_attn_maps(
+                        captured_modules,
+                    )
         finally:
+            if capture_attn:
+                self._set_graph_cross_attn_capture(False)
             self.model.generator.train(was_training)
 
         if not self.is_main_process:
@@ -234,6 +478,7 @@ class UISimTrainingVisualizer:
                 },
                 step=step,
             )
+        self._log_graph_cross_attn_maps(captured_attn, step)
 
     def log_rollout(self, step: int) -> None:
         if not self.enabled or self.rollout_interval <= 0:
