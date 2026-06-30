@@ -127,6 +127,7 @@ class Trainer:
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay
         )
+        self._log_trainable_generator_parameters()
 
         # Step 3: Initialize the dataloader
         dataset = build_training_dataset(config)
@@ -290,6 +291,69 @@ class Trainer:
                 )
         if reset_peak:
             torch.cuda.reset_peak_memory_stats(self.device)
+
+    @staticmethod
+    def _normalize_parameter_name(name: str) -> str:
+        return (
+            name.replace("_fsdp_wrapped_module.", "")
+            .replace("_checkpoint_wrapped_module.", "")
+            .replace("_orig_mod.", "")
+        )
+
+    @staticmethod
+    def _trainable_parameter_category(name: str) -> str:
+        if "action_condition_cross_attn" in name:
+            return "action_condition_cross_attn"
+        if "condition_cross_attn" in name:
+            return "graph_condition_cross_attn"
+        if "ui_conditioner" in name:
+            return "ui_conditioner"
+        return "other"
+
+    def _log_trainable_generator_parameters(self) -> None:
+        if not self.is_main_process:
+            return
+
+        total_params = 0
+        trainable_params = 0
+        trainable_names = []
+        trainable_by_category = {
+            "graph_condition_cross_attn": 0,
+            "action_condition_cross_attn": 0,
+            "ui_conditioner": 0,
+            "other": 0,
+        }
+        for name, param in self.model.generator.named_parameters():
+            normalized_name = self._normalize_parameter_name(name)
+            param_count = param.numel()
+            total_params += param_count
+            if not param.requires_grad:
+                continue
+            trainable_params += param_count
+            category = self._trainable_parameter_category(normalized_name)
+            trainable_by_category[category] += param_count
+            trainable_names.append(normalized_name)
+
+        print(
+            "[trainable] generator parameters: "
+            f"{trainable_params:,} / {total_params:,} trainable",
+            flush=True,
+        )
+        for category, count in trainable_by_category.items():
+            print(f"[trainable]   {category}: {count:,}", flush=True)
+        print("[trainable] trainable parameter names:", flush=True)
+        for name in trainable_names[:80]:
+            print(f"[trainable]   {name}", flush=True)
+        if len(trainable_names) > 80:
+            print(
+                f"[trainable]   ... {len(trainable_names) - 80} more",
+                flush=True,
+            )
+        if trainable_by_category["other"] > 0:
+            print(
+                "[trainable] WARNING: parameters outside UI/condition CA are trainable.",
+                flush=True,
+            )
             
     def save(self):
         print("Start gathering distributed model states...")
