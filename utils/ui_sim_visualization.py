@@ -251,6 +251,15 @@ class UISimTrainingVisualizer:
         write_png(image.contiguous(), str(output_path))
         return output_path
 
+    @staticmethod
+    def _row_normalized_heat(heat: torch.Tensor) -> torch.Tensor:
+        heat = torch.nan_to_num(heat.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if heat.ndim != 2 or heat.numel() == 0:
+            return heat
+        row_max = heat.max(dim=-1, keepdim=True).values
+        row_max = torch.where(row_max > 0.0, row_max, torch.ones_like(row_max))
+        return heat / row_max
+
     def _selected_cross_attn_frames(self, slot_map: torch.Tensor) -> list[int]:
         limit = max(0, self.cross_attn_map_frame_limit)
         if limit <= 0:
@@ -287,7 +296,7 @@ class UISimTrainingVisualizer:
         if patch_frame.shape[0] != grid_h * grid_w:
             return None
         heatmaps = [
-            self._heat_to_uint8(patch_frame[:, slot].reshape(grid_h, grid_w))
+            patch_frame[:, slot].reshape(grid_h, grid_w).detach().float()
             for slot in slots
         ]
         return torch.cat(heatmaps, dim=1)
@@ -330,6 +339,14 @@ class UISimTrainingVisualizer:
                 slot_map,
                 f"cross_attn_block_{block_index:02d}_slots_step_{step:06d}.png",
             )
+            slot_row_norm_path = self._write_heat_png(
+                self._row_normalized_heat(slot_map),
+                f"cross_attn_block_{block_index:02d}_slots_rowmax_step_{step:06d}.png",
+            )
+            slot_row_sum_path = self._write_heat_png(
+                slot_map.sum(dim=-1, keepdim=True),
+                f"cross_attn_block_{block_index:02d}_slots_rowsum_step_{step:06d}.png",
+            )
             print(
                 f"[visualization] wrote graph cross-attention slot map to {slot_path}",
                 flush=True,
@@ -343,6 +360,24 @@ class UISimTrainingVisualizer:
                             "cols=graph-token slots."
                         ),
                     )
+                )
+                wandb_payload[
+                    f"preview/graph_cross_attn_block{block_index}_slots_rowmax"
+                ] = wandb.Image(
+                    str(slot_row_norm_path),
+                    caption=(
+                        f"Graph CA block {block_index}: rows=frames, "
+                        "cols=graph-token slots, each row normalized by its own max."
+                    ),
+                )
+                wandb_payload[
+                    f"preview/graph_cross_attn_block{block_index}_slots_rowsum"
+                ] = wandb.Image(
+                    str(slot_row_sum_path),
+                    caption=(
+                        f"Graph CA block {block_index}: per-frame slot attention sum. "
+                        "Valid graph-conditioned rows should be bright."
+                    ),
                 )
                 wandb_payload[
                     f"preview/graph_cross_attn_block{block_index}_top_tokens"
