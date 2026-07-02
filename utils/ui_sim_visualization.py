@@ -207,6 +207,8 @@ class UISimTrainingVisualizer:
     def _collect_graph_cross_attn_maps(
         self,
         modules: list[tuple[str, Any]],
+        *,
+        output_num_frames: int | None = None,
     ) -> list[dict[str, Any]]:
         captured: list[dict[str, Any]] = []
         for block_index, (name, module) in enumerate(modules):
@@ -214,13 +216,32 @@ class UISimTrainingVisualizer:
             patch_map = getattr(module, "last_attn_patch_map", None)
             if slot_map is None or patch_map is None:
                 continue
+            raw_num_frames = int(getattr(module, "last_attn_num_frames", 0))
+            frame_offset = 0
+            if (
+                output_num_frames is not None
+                and output_num_frames > 0
+                and raw_num_frames == 2 * int(output_num_frames)
+            ):
+                # Teacher forcing in CausalWanModel runs an internal
+                # [clean-context frames | noisy/output frames] sequence. The
+                # graph/action conditions are aligned to the noisy half, so the
+                # first half of captured rows is expected to be black.
+                frame_offset = int(output_num_frames)
+                slot_map = slot_map[frame_offset:frame_offset + int(output_num_frames)]
+                patch_map = patch_map[frame_offset:frame_offset + int(output_num_frames)]
+                num_frames = int(output_num_frames)
+            else:
+                num_frames = raw_num_frames
             captured.append(
                 {
                     "block_index": block_index,
                     "name": name,
                     "slot_map": slot_map,
                     "patch_map": patch_map,
-                    "num_frames": int(getattr(module, "last_attn_num_frames", 0)),
+                    "num_frames": num_frames,
+                    "raw_num_frames": raw_num_frames,
+                    "frame_offset": frame_offset,
                     "tokens_per_frame": int(
                         getattr(module, "last_attn_tokens_per_frame", 0)
                     ),
@@ -329,6 +350,7 @@ class UISimTrainingVisualizer:
         for item in captured:
             block_index = int(item["block_index"])
             num_frames = max(0, int(item["num_frames"]))
+            frame_offset = max(0, int(item.get("frame_offset", 0)))
             slot_map = item["slot_map"]
             patch_map = item["patch_map"]
             if num_frames > 0:
@@ -352,12 +374,19 @@ class UISimTrainingVisualizer:
                 flush=True,
             )
             if not self.disable_wandb:
+                frame_caption = (
+                    f" Rows are noisy/output frames cropped from teacher-forcing "
+                    f"raw rows offset {frame_offset}."
+                    if frame_offset > 0
+                    else ""
+                )
                 wandb_payload[f"preview/graph_cross_attn_block{block_index}_slots"] = (
                     wandb.Image(
                         str(slot_path),
                         caption=(
                             f"Graph CA block {block_index}: rows=frames, "
                             "cols=graph-token slots."
+                            f"{frame_caption}"
                         ),
                     )
                 )
@@ -368,6 +397,7 @@ class UISimTrainingVisualizer:
                     caption=(
                         f"Graph CA block {block_index}: rows=frames, "
                         "cols=graph-token slots, each row normalized by its own max."
+                        f"{frame_caption}"
                     ),
                 )
                 wandb_payload[
@@ -377,6 +407,7 @@ class UISimTrainingVisualizer:
                     caption=(
                         f"Graph CA block {block_index}: per-frame slot attention sum. "
                         "Valid graph-conditioned rows should be bright."
+                        f"{frame_caption}"
                     ),
                 )
                 wandb_payload[
@@ -479,6 +510,11 @@ class UISimTrainingVisualizer:
                 if capture_attn:
                     captured_attn = self._collect_graph_cross_attn_maps(
                         captured_modules,
+                        output_num_frames=(
+                            clean_latent.shape[1]
+                            if bool(getattr(self.model, "teacher_forcing", False))
+                            else None
+                        ),
                     )
         finally:
             if capture_attn:

@@ -359,6 +359,30 @@ def test_ui_training_visualizer_keeps_node_positions() -> None:
     assert torch.equal(ui_batch["node_positions"], batch["node_positions"])
 
 
+def test_ui_training_visualizer_crops_teacher_forcing_attn_maps() -> None:
+    visualizer = UISimTrainingVisualizer.__new__(UISimTrainingVisualizer)
+    module = SimpleNamespace(
+        last_attn_slot_map=torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2),
+        last_attn_patch_map=torch.arange(6 * 4 * 2, dtype=torch.float32).reshape(6, 4, 2),
+        last_attn_num_frames=6,
+        last_attn_tokens_per_frame=2,
+        last_attn_frame_seqlen=4,
+        last_attn_grid_hw=(2, 2),
+    )
+
+    captured = visualizer._collect_graph_cross_attn_maps(
+        [("blocks.0.condition_cross_attn", module)],
+        output_num_frames=3,
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["frame_offset"] == 3
+    assert captured[0]["raw_num_frames"] == 6
+    assert captured[0]["num_frames"] == 3
+    assert torch.equal(captured[0]["slot_map"], module.last_attn_slot_map[3:])
+    assert torch.equal(captured[0]["patch_map"], module.last_attn_patch_map[3:])
+
+
 def test_causal_wan_rebuilds_block_mask_for_visualization_shape(
     monkeypatch,
 ) -> None:
